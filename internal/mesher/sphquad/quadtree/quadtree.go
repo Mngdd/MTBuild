@@ -190,6 +190,39 @@ func (t *Tree) LeafAt(x, y float64) *Node {
 	return n
 }
 
+// SampleHt returns an interpolated Ht at an arbitrary point, so callers don't
+// have to re-evaluate the (expensive, brute-force) size field themselves —
+// that cost is paid once per leaf when the tree is built.
+//
+// True bilinear needs four corner values; on an adaptive tree the leaf at a
+// corner isn't a fixed neighbour, so each corner is taken from whichever leaf
+// a point-probe just past it lands in (falls back to the containing leaf's own
+// value at the domain edge). This is continuous everywhere except at T-junction
+// seams between differently-sized leaves, where it can show a small kink —
+// acceptable for a sizing field. ok is false only if (x,y) is outside the root.
+func (t *Tree) SampleHt(x, y float64) (float64, bool) {
+	n := t.LeafAt(x, y)
+	if n == nil {
+		return 0, false
+	}
+	half := n.Size / 2
+	eps := n.Size * 0.01
+	corner := func(dx, dy float64) float64 {
+		if ln := t.LeafAt(x+dx*(half+eps), y+dy*(half+eps)); ln != nil {
+			return ln.Ht
+		}
+		return n.Ht
+	}
+	sw, se := corner(-1, -1), corner(1, -1)
+	ne, nw := corner(1, 1), corner(-1, 1)
+
+	u := (x - (n.CX - half)) / (2 * half)
+	v := (y - (n.CY - half)) / (2 * half)
+	bottom := sw + (se-sw)*u
+	top := nw + (ne-nw)*u
+	return bottom + (top-bottom)*v, true
+}
+
 // EachLeaf calls fn for every leaf.
 func (t *Tree) EachLeaf(fn func(*Node)) { t.eachLeaf(fn) }
 

@@ -17,6 +17,7 @@ import (
 	"MTBuild/internal/mesher"
 	"MTBuild/internal/viz"
 
+	_ "MTBuild/internal/mesher/charge"  // register the "charge-voronoi" algorithm
 	_ "MTBuild/internal/mesher/grid"    // register the "grid" algorithm
 	_ "MTBuild/internal/mesher/sphquad" // register the "sph-quadtree" algorithm
 )
@@ -57,9 +58,18 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	printMetrics(metrics)
+	if m.Polygonal {
+		printPolyMetrics(mesh.EvaluatePoly(m))
+	} else {
+		printMetrics(metrics)
+	}
 	if *outSVG != "" {
-		writeFile(*outSVG, func(f *os.File) error { return viz.MeshSVG(f, g, m, *width) })
+		writeFile(*outSVG, func(f *os.File) error {
+			if m.Polygonal {
+				return viz.PolyMeshSVG(f, g, m, *width)
+			}
+			return viz.MeshSVG(f, g, m, *width)
+		})
 	}
 	if *outMesh != "" {
 		writeFile(*outMesh, func(f *os.File) error { return export.Write(f, m, *outMesh) })
@@ -89,11 +99,11 @@ func (stderrSink) Progress(stage string, frac float64) {
 	fmt.Fprintf(os.Stderr, "  [%-14s] %3.0f%%\n", stage, frac*100)
 }
 func (stderrSink) Snapshot(fr mesher.Frame) {
-	tris := 0
+	cells := 0
 	if fr.Mesh != nil {
-		tris = len(fr.Mesh.Triangles)
+		cells = len(fr.Mesh.Triangles) + len(fr.Mesh.Cells)
 	}
-	fmt.Fprintf(os.Stderr, "  snapshot %-14s iter=%d points=%d tris=%d\n", fr.Stage, fr.Iter, len(fr.Particles), tris)
+	fmt.Fprintf(os.Stderr, "  snapshot %-14s iter=%d points=%d cells=%d\n", fr.Stage, fr.Iter, len(fr.Particles), cells)
 }
 
 func printMetrics(q mesh.QualityMetrics) {
@@ -102,6 +112,21 @@ func printMetrics(q mesh.QualityMetrics) {
 	fmt.Print("angle histogram (15 deg bins): ")
 	for i, c := range q.AngleHistogram {
 		fmt.Printf("%d-%d:%d ", i*15, i*15+15, c)
+	}
+	fmt.Println()
+}
+
+func printPolyMetrics(q mesh.PolyQualityMetrics) {
+	fmt.Printf("cells=%d  avg_sides=%.2f  iso_avg=%.3f  iso_min=%.3f  area_cv=%.3f\n",
+		q.Cells, q.AvgSides, q.IsoAvg, q.IsoMin, q.AreaCV)
+	fmt.Print("sides histogram: ")
+	last := len(q.SidesHistogram) - 1
+	for i, c := range q.SidesHistogram {
+		if i == last {
+			fmt.Printf("%d+:%d ", i+3, c) // last bucket collects everything with this many sides or more
+		} else {
+			fmt.Printf("%d:%d ", i+3, c)
+		}
 	}
 	fmt.Println()
 }

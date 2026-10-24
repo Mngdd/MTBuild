@@ -1,0 +1,524 @@
+// Package charge — второй алгоритм построения сетки ("черная коробка" #2):
+// центры ячеек — одноимённо заряженные частицы, которые отталкиваются по
+// закону F = k / r^n (n — параметр, по умолчанию 2 — обычный Кулон), с
+// затуханием, чтобы они успокоились, а не разлетелись. Поля целевого размера,
+// как h_t у sph-quadtree, тут нет — фиксированное число частиц сеется с
+// примерно равномерной плотностью, и одно отталкивание раскладывает их в
+// ровную упаковку (физически — релаксация 2D однокомпонентной плазмы, в духе
+// задачи Томсона; и, не случайно, это способ получить центроидальное разбиение
+// Вороного через силы, а не итерациями Ллойда).
+//
+// Итоговые ячейки берутся из диаграммы Вороного осевших частиц, а не из
+// триангуляции Делоне напрямую — поэтому, в отличие от grid и sph-quadtree,
+// выход этого алгоритма — Mesh.Cells (многоугольники), а не Mesh.Triangles.
+// Метрики качества для них — mesh.EvaluatePoly.
+//
+// Упрощения MVP: только равномерная плотность (без поля размеров и адаптации
+// по кривизне); силы считаются попарно за O(n^2) (на количествах частиц MVP
+// нормально — без пространственного хеша); ячейки Вороного строятся для
+// каждой частицы из циркумцентров Делоне с сортировкой по углу, а не через
+// нормальную структуру half-edge; циркумцентр, попавший вне домена,
+// снэпается на ближайшую точку границы вместо честного отсечения многоугольника.
+package charge
+
+import (
+	"context"
+	"math"
+	"math/rand"
+	"sort"
+
+	"MTBuild/internal/delaunay"
+	"MTBuild/internal/geometry"
+	"MTBuild/internal/mesh"
+	"MTBuild/internal/mesher"
+)
+
+func init() { mesher.Register("charge-voronoi", func() mesher.Mesher { return Mesher{} }) }
+
+type Mesher struct{}
+
+func (Mesher) Name() string { return "charge-voronoi" }
+
+// Параметры — в долях габарита геометрии, как у sph-quadtree, чтобы оба
+// алгоритма в UI ощущались одинаково.
+var (
+	pH        = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
+	pExp      = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 4, Def: 2, Step: 0.5}
+	pK        = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
+	pDamping  = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
+	pClamp    = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
+	pMaxStep  = mesher.ParamSpec{Key: "max_step", Label: "Max step (× h)", Min: 0.05, Max: 1, Def: 0.3, Step: 0.05, DependsOn: "clamp"}
+	pSeparate = mesher.ParamSpec{Key: "separate", Label: "Push apart coincident particles", Kind: mesher.KindBool, Def: 1}
+	pIters    = mesher.ParamSpec{Key: "iters", Label: "Relaxation iterations", Min: 10, Max: 2000, Def: 300, Step: 10}
+)
+
+func (Mesher) Params() []mesher.ParamSpec {
+	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pSeparate, pIters}
+}
+
+func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params, sink mesher.Sink) (mesh.Mesh, mesh.QualityMetrics, error) {
+	h := p.Get(pH)
+	expo := p.Get(pExp)
+	k := p.Get(pK)
+	clamp := p.Bool(pClamp)
+	separate := p.Bool(pSeparate)
+	damping := p.Get(pDamping)
+	iters := int(p.Get(pIters))
+
+	// --- нормализация в единичный габарит, как у sph-quadtree --------------
+	min, max := g.BoundingBox()
+	cx, cy := (min.X+max.X)/2, (min.Y+max.Y)/2
+	scale := math.Max(max.X-min.X, max.Y-min.Y)
+	if scale == 0 {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, errDegenerate
+	}
+	// нормируем ибо параметры такие как h требуют нормировки размера
+	norm := func(pt geometry.Point) geometry.Point {
+		return geometry.Point{X: (pt.X - cx) / scale, Y: (pt.Y - cy) / scale}
+	}
+	// расплющить обратно, заготовили заранее
+	denorm := func(pt geometry.Point) geometry.Point {
+		return geometry.Point{X: pt.X*scale + cx, Y: pt.Y*scale + cy}
+	}
+	// нормир геома
+	gn := mapGeometry(g, norm)
+
+	// --- инишал спавн частиц: фиксированные граничные заряды + подвижные внутренние ------
+	// Граничные заряды ставятся вдвое плотнее шага внутренних (0.5h, а не h):
+	// ниже нет честного отсечения ячеек по контуру, и ограничивать веер
+	// треугольников Делоне у внутренних частиц приходится одному лишь плотному
+	// кольцу граничных. Замерено на круге: при шаге кольца h ячейки у самого
+	// края выходят слиперами (IsoAvg 0.73, IsoMin 0.06), при h/2 — чистые
+	// (IsoAvg 0.85, IsoMin 0.79) при том же посеве внутренних.
+	sink.Progress("init", 0)
+	boundary := resampleBoundary(gn.Outer, 0.5*h) // сыпем у границ
+	for _, hole := range gn.Holes {
+		boundary = append(boundary, resampleBoundary(hole, 0.5*h)...)
+	}
+	rng := rand.New(rand.NewSource(1))
+	interior := interiorLattice(gn, h, rng) // сыпем внутрянку
+	if len(interior) < 3 {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, errTooFewCells
+	}
+	if err := ctx.Err(); err != nil {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+	}
+	sink.Progress("init", 1)
+	sink.Snapshot(mesher.Frame{Stage: "init", Particles: denormAll(append(append([]geometry.Point{}, interior...), boundary...), denorm)})
+
+	// --- релаксация: попарное отталкивание + затухание ---------------------
+	vel := make([]geometry.Point, len(interior))
+	maxStep := p.Get(pMaxStep) * h // предел смещения частицы за шаг; держит систему в рамках при любых damping/n
+	for it := 0; it < iters; it++ {
+		if err := ctx.Err(); err != nil {
+			return mesh.Mesh{}, mesh.QualityMetrics{}, err
+		}
+		if separate {
+			separateCoincident(interior, vel, boundary, gn, 0.1*h, rng)
+		}
+		forces := make([]geometry.Point, len(interior))
+		for i := range interior {
+			var fx, fy float64
+			for j := range interior {
+				if j == i {
+					continue
+				}
+				fx2, fy2 := repel(interior[i], interior[j], k, expo)
+				fx += fx2
+				fy += fy2
+			}
+			for j := range boundary {
+				fx2, fy2 := repel(interior[i], boundary[j], k, expo)
+				fx += fx2
+				fy += fy2
+			}
+			forces[i] = geometry.Point{X: fx, Y: fy}
+		}
+		for i := range interior {
+			vel[i].X = damping*vel[i].X + forces[i].X
+			vel[i].Y = damping*vel[i].Y + forces[i].Y
+			vel[i] = sanitise(vel[i])
+			if clamp {
+				vel[i] = clampMag(vel[i], maxStep)
+			}
+			np := geometry.Point{X: interior[i].X + vel[i].X, Y: interior[i].Y + vel[i].Y}
+			if !gn.Contains(np) {
+				np = gn.Nearest(np) // граничные заряды почти не выпускают; редкого беглеца хватает вернуть на край
+				vel[i] = geometry.Point{}
+			}
+			interior[i] = np
+		}
+		if it%10 == 0 || it == iters-1 {
+			sink.Progress("relax", float64(it)/float64(iters))
+			sink.Snapshot(mesher.Frame{Stage: "relax", Iter: it, Particles: denormAll(interior, denorm)})
+		}
+	}
+	if separate {
+		// последний шаг цикла мог снова снэпнуть двоих в одну точку
+		separateCoincident(interior, vel, boundary, gn, 0.1*h, rng)
+	}
+	sink.Progress("relax", 1)
+
+	// --- ячейки Вороного по осевшим частицам -------------------------------
+	sink.Progress("voronoi", 0)
+	// Совпавшие частицы (separate выключен, или разлёт не нашёл места внутри)
+	// склеиваем в одну перед Делоне — всегда: в релаксации пара давила как
+	// заряд 2, а ячейка у неё одна. Сама библиотека Делоне дубли тоже молча
+	// пропускает, но полагаться на это не хотим.
+	sites := mergeCoincident(append(append([]geometry.Point{}, interior...), boundary...))
+	tris, err := delaunay.Triangulate(sites) // делонешим
+	if err != nil {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+	}
+	// тут надо вырезать треугольники чьи центроиды (всегда внутри треуга) не внутри формы
+	// иначе получим что мы вылезем за форму. циркумцентр не подходит тк мб вне треуга
+	validTris := tris[:0]
+	for _, t := range tris {
+		c := geometry.Point{
+			X: (sites[t[0]].X + sites[t[1]].X + sites[t[2]].X) / 3,
+			Y: (sites[t[0]].Y + sites[t[1]].Y + sites[t[2]].Y) / 3,
+		}
+		if gn.Contains(c) {
+			validTris = append(validTris, t)
+		}
+	}
+	tris = validTris
+
+	// теперь для каждой частицы собираем треугольники к которым она относится
+	trisAtSite := triangleAdjacency(len(sites), tris)
+
+	// Насколько близко к границе должен оказаться циркумцентр, чтобы его
+	// просто прилепили на неё — см. комментарий к voronoiCell. 0.6h взято с
+	// запасом нарочно ("максимально тупой способ"): лучше чуть сплющить
+	// внешний ряд, чем оставить щель между сеткой и краем.
+
+	// TODO: это должно исчезнуть как только будет введено слипание частиц в общем
+	// TODO: слипание должно влиять на частицу+частицу и частица+граница
+	snapMargin := 0.6 * h
+
+	// Такие маленькие ячейки — остатки граничных частиц, зажатые между
+	// настоящим краем и первым рядом внутренних: площадь реальная, но на глаз
+	// не видна, а рой таких почти нулевых треугольников портит средние метрики
+	// формы. Выкинув их, видимую щель не откроешь (в том и смысл "не видно"),
+	// так что это чистка метрик/размера выхода, а не условие корректности, как
+	// сам факт построения ячеек для всех частиц.
+	minCellArea := 0.01 * h * h
+
+	var vertsNorm []geometry.Point
+	var cells [][]int
+	for i := range sites {
+		poly := voronoiCell(sites, tris, trisAtSite[i], i, gn, snapMargin)
+		if len(poly) < 3 || polyArea(poly) < minCellArea {
+			continue // вырожденная (одна из частиц на оболочке) или слишком мелкая
+		}
+		base := len(vertsNorm)
+		vertsNorm = append(vertsNorm, poly...)
+		idx := make([]int, len(poly))
+		for k := range poly {
+			idx[k] = base + k
+		}
+		cells = append(cells, idx)
+	}
+	sink.Progress("voronoi", 1)
+
+	worldPos := make([]geometry.Point, len(vertsNorm))
+	for i, v := range vertsNorm {
+		worldPos[i] = denorm(v)
+	}
+	m := mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true}
+	sink.Snapshot(mesher.Frame{Stage: "done", Iter: iters, Particles: worldPos, Mesh: &m})
+
+	// QualityMetrics — метрики для треугольной сетки, здесь неприменимы
+	// (Mesh.Triangles пуст); вызывающий проверяет Mesh.Polygonal и зовёт
+	// mesh.EvaluatePoly(m) — см. mesh.PolyQualityMetrics.
+	return m, mesh.QualityMetrics{}, nil
+}
+
+// coincideEps — расстояние, на котором частицы считаются совпавшими: repel
+// для них возвращает 0, и без разлёта они так и едут вместе навсегда.
+const coincideEps = 1e-9
+
+// separateCoincident разводит совпавшие частицы (separate включён).
+//   - две внутренние: в противоположные стороны вдоль разности их скоростей,
+//     каждая на dist; если разность нулевая (обе стоят или летят одинаково) —
+//     в случайную сторону. Вылетевшую за контур возвращаем на край через Nearest;
+//   - внутренняя на граничном заряде: граничные неподвижны, двигается только
+//     внутренняя, на 2*dist в случайную сторону, до 8 попыток попасть внутрь.
+func separateCoincident(interior, vel, boundary []geometry.Point, gn geometry.Geometry, dist float64, rng *rand.Rand) {
+	for i := range interior {
+		for j := i + 1; j < len(interior); j++ {
+			if interior[i].Dist(interior[j]) >= coincideEps {
+				continue
+			}
+			rx, ry := vel[i].X-vel[j].X, vel[i].Y-vel[j].Y
+			rl := math.Hypot(rx, ry)
+			var d geometry.Point
+			if rl < coincideEps {
+				d = randomDir(rng)
+			} else {
+				d = geometry.Point{X: rx / rl, Y: ry / rl}
+			}
+			interior[i] = shiftInside(interior[i], d, dist, gn)
+			interior[j] = shiftInside(interior[j], d, -dist, gn)
+		}
+		for _, b := range boundary {
+			if interior[i].Dist(b) >= coincideEps {
+				continue
+			}
+			for try := 0; try < 8; try++ {
+				d := randomDir(rng)
+				np := geometry.Point{X: interior[i].X + 2*dist*d.X, Y: interior[i].Y + 2*dist*d.Y}
+				if gn.Contains(np) {
+					interior[i] = np
+					break
+				}
+			}
+		}
+	}
+}
+
+func shiftInside(p, d geometry.Point, s float64, gn geometry.Geometry) geometry.Point {
+	np := geometry.Point{X: p.X + s*d.X, Y: p.Y + s*d.Y}
+	if !gn.Contains(np) {
+		np = gn.Nearest(np)
+	}
+	return np
+}
+
+func randomDir(rng *rand.Rand) geometry.Point {
+	a := 2 * math.Pi * rng.Float64()
+	return geometry.Point{X: math.Cos(a), Y: math.Sin(a)}
+}
+
+// mergeCoincident оставляет из каждой группы совпавших точек первую. O(N²),
+// но один раз за Generate — на фоне релаксации незаметно.
+func mergeCoincident(pts []geometry.Point) []geometry.Point {
+	out := pts[:0:0]
+	for _, p := range pts {
+		dup := false
+		for _, q := range out {
+			if p.Dist(q) < coincideEps {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// repel возвращает силу на a от одноимённого заряда b: величина k/r^n,
+// направление — от b. Защищено от r=0 (совпавших точек).
+func repel(a, b geometry.Point, k, expo float64) (fx, fy float64) {
+	dx, dy := a.X-b.X, a.Y-b.Y
+	r := math.Hypot(dx, dy)
+	if r < coincideEps {
+		return 0, 0
+	}
+	mag := k / math.Pow(r, expo)
+	return mag * dx / r, mag * dy / r
+}
+
+func clampMag(p geometry.Point, lim float64) geometry.Point {
+	m := math.Hypot(p.X, p.Y)
+	if m > lim && m > 0 {
+		return geometry.Point{X: p.X * lim / m, Y: p.Y * lim / m}
+	}
+	return p
+}
+
+func sanitise(p geometry.Point) geometry.Point {
+	fix := func(v float64) float64 {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0
+		}
+		return v
+	}
+	return geometry.Point{X: fix(p.X), Y: fix(p.Y)}
+}
+
+// triangleAdjacency возвращает для каждой частицы индексы (в tris)
+// треугольников, в которые она входит.
+func triangleAdjacency(nSites int, tris [][3]int) [][]int {
+	out := make([][]int, nSites)
+	for ti, t := range tris {
+		for _, vi := range t {
+			out[vi] = append(out[vi], ti)
+		}
+	}
+	return out
+}
+
+// voronoiCell строит ячейку Вороного частицы i из циркумцентров всех
+// треугольников Делоне, в которые она входит, упорядоченных по углу вокруг
+// частицы. Честного отсечения по контуру нет (см. описание пакета) — вместо
+// этого любой циркумцентр вне домена ИЛИ внутри, но ближе snapMargin к краю,
+// переносится на ближайшую точку границы. Без второй половины условия ячейки
+// у края до него не дотягивают и оставляют видимую щель; это самый тупой
+// фикс, чтобы они реально доставали до края, ценой сплющивания их формы у
+// самой границы.
+//
+// Угол для сортировки берётся от *неперенесённого* циркумцентра, а не от
+// точки, которая реально сохраняется. Сортировка по перенесённой позиции в
+// принципе могла бы переставить несколько циркумцентров, прилипших к
+// соседним участкам кривой границы, и многоугольник пересёк бы сам себя
+// (заливка even-odd по сканлиниям в viz корректно заливает только простые
+// многоугольники). Это подозревалось как причина бага "незалитые ячейки у
+// края", но тест на самопересечение со старой сортировкой ничего не нашёл —
+// настоящей причиной было выкидывание ячеек граничных частиц (см. Generate).
+// Сортировку по настоящему направлению всё равно оставили: она правильная по
+// построению, а не по везению.
+//
+// sites: все точки, tris: сетка делоне, myTris: треуги в которых есть точка, i: idx точки, gn: контуры все aka геома, snapMargin: порог прилипания к краю
+func voronoiCell(sites []geometry.Point, tris [][3]int, myTris []int, i int, gn geometry.Geometry, snapMargin float64) []geometry.Point {
+	site := sites[i]
+	type pt struct {
+		p   geometry.Point
+		ang float64
+	}
+
+	seen := make([]pt, 0, len(myTris)) // углы
+	for _, ti := range myTris {
+		t := tris[ti]
+		// ф-ла центра окр-ти через 3 точки. угол из центра в циркумцентр
+		c, ok := circumcenter(sites[t[0]], sites[t[1]], sites[t[2]])
+		if !ok {
+			continue
+		}
+		ang := math.Atan2(c.Y-site.Y, c.X-site.X)
+		if near := gn.Nearest(c); !gn.Contains(c) || c.Dist(near) < snapMargin {
+			c = near
+		}
+		seen = append(seen, pt{p: c, ang: ang})
+	}
+	// сортируем по углу
+	sort.Slice(seen, func(a, b int) bool { return seen[a].ang < seen[b].ang })
+
+	// прилипание тянет несколько изначально разных циркумцентров в одну или
+	// почти одну точку, и такие теперь лишние вершины тоже надо склеить
+	dedupTol := snapMargin * 0.1
+	out := make([]geometry.Point, 0, len(seen))
+	for _, s := range seen {
+		if len(out) > 0 && out[len(out)-1].Dist(s.p) < dedupTol {
+			continue
+		}
+		out = append(out, s.p)
+	}
+	if len(out) > 1 && out[0].Dist(out[len(out)-1]) < dedupTol {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// polyArea — площадь простого многоугольника по формуле шнурков (знак не
+// важен — она идёт только в сравнение "слишком мелкая или нет", где намотка
+// роли не играет).
+func polyArea(pts []geometry.Point) float64 {
+	var a float64
+	n := len(pts)
+	for i := 0; i < n; i++ {
+		j := (i + 1) % n
+		a += pts[i].X*pts[j].Y - pts[j].X*pts[i].Y
+	}
+	return math.Abs(a) / 2
+}
+
+// circumcenter возвращает центр окружности через a, b, c. ok = false для
+// вырожденного треугольника (точки на одной прямой).
+func circumcenter(a, b, c geometry.Point) (geometry.Point, bool) {
+	d := 2 * (a.X*(b.Y-c.Y) + b.X*(c.Y-a.Y) + c.X*(a.Y-b.Y))
+	if math.Abs(d) < 1e-12 {
+		return geometry.Point{}, false
+	}
+	a2 := a.X*a.X + a.Y*a.Y
+	b2 := b.X*b.X + b.Y*b.Y
+	c2 := c.X*c.X + c.Y*c.Y
+	ux := (a2*(b.Y-c.Y) + b2*(c.Y-a.Y) + c2*(a.Y-b.Y)) / d
+	uy := (a2*(c.X-b.X) + b2*(a.X-c.X) + c2*(b.X-a.X)) / d
+	return geometry.Point{X: ux, Y: uy}, true
+}
+
+// resampleBoundary идёт вдоль замкнутого контура и ставит точки примерно
+// через step — та же техника, что в internal/mesher/grid (там она не
+// экспортирована, а делить её между двумя MVP-алгоритмами не стоит того).
+func resampleBoundary(pl geometry.Polyline, step float64) []geometry.Point {
+	if len(pl) < 2 || step <= 0 {
+		return append([]geometry.Point(nil), pl...)
+	}
+	var out []geometry.Point
+	carry := 0.0
+	for i := 0; i < len(pl); i++ {
+		a := pl[i]
+		b := pl[(i+1)%len(pl)]
+		seg := a.Dist(b)
+		if seg == 0 {
+			continue
+		}
+		dx, dy := (b.X-a.X)/seg, (b.Y-a.Y)/seg
+		for d := carry; d < seg; d += step {
+			out = append(out, geometry.Point{X: a.X + dx*d, Y: a.Y + dy*d})
+		}
+		carry = math.Mod(carry-seg, step)
+		if carry < 0 {
+			carry += step
+		}
+	}
+	return out
+}
+
+// interiorLattice сеет подвижные заряды на решётке с джиттером внутри
+// домена. Только равномерная плотность — в отличие от sph-quadtree, тут нет
+// поля размеров, по которому прореживать, расстановку делает отталкивание.
+// Джиттер здесь важнее, чем был бы для статичной сетки: идеально ровная
+// стартовая решётка во многих местах даёт точки ровно на одной окружности или
+// прямой — вырожденный вход для Делоне.
+func interiorLattice(g geometry.Geometry, step float64, rng *rand.Rand) []geometry.Point {
+	min, max := g.BoundingBox()
+	var out []geometry.Point
+	for y := min.Y + step/2; y < max.Y; y += step {
+		for x := min.X + step/2; x < max.X; x += step {
+			p := geometry.Point{
+				X: x + (rng.Float64()-0.5)*step*0.3,
+				Y: y + (rng.Float64()-0.5)*step*0.3,
+			}
+			if g.Contains(p) {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+func denormAll(pts []geometry.Point, denorm func(geometry.Point) geometry.Point) []geometry.Point {
+	out := make([]geometry.Point, len(pts))
+	for i, p := range pts {
+		out[i] = denorm(p)
+	}
+	return out
+}
+
+func mapGeometry(g geometry.Geometry, f func(geometry.Point) geometry.Point) geometry.Geometry {
+	mapPl := func(pl geometry.Polyline) geometry.Polyline {
+		out := make(geometry.Polyline, len(pl))
+		for i, p := range pl {
+			out[i] = f(p)
+		}
+		return out
+	}
+	out := geometry.Geometry{Outer: mapPl(g.Outer)}
+	for _, h := range g.Holes {
+		out.Holes = append(out.Holes, mapPl(h))
+	}
+	return out
+}
+
+type chargeErr string
+
+func (e chargeErr) Error() string { return string(e) }
+
+const (
+	errDegenerate  = chargeErr("charge: degenerate geometry (zero-size bounding box)")
+	errTooFewCells = chargeErr("charge: h too large for this geometry (fewer than 3 interior sites seeded)")
+)

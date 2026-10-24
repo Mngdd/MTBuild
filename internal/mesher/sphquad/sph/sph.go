@@ -55,6 +55,7 @@ type Config struct {
 	Tol          float64 // convergence: stop when mean move / h < Tol
 	RampFraction float64 // fraction of iterations spent in the free-momentum phase
 	Damping      float64 // velocity retained between steps during the ramp phase
+	Theta        float64 // scaling coefficient applied to every h_t sample (thesis section 3); 0 => 1 (no scaling)
 	Seed         int64
 }
 
@@ -76,6 +77,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.Damping == 0 {
 		c.Damping = 0.9
+	}
+	if c.Theta == 0 {
+		c.Theta = 1
 	}
 	return c
 }
@@ -104,7 +108,7 @@ func Relax(ctx context.Context, ps []Particle, size SizeFn, dom Domain, contours
 
 		hMax := 0.0
 		for i := range ps {
-			ps[i].Ht = clampPos(size(ps[i].Pos))
+			ps[i].Ht = clampPos(cfg.Theta * size(ps[i].Pos))
 			if ps[i].Ht > hMax {
 				hMax = ps[i].Ht
 			}

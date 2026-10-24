@@ -3,11 +3,17 @@ package mesh
 
 import "MTBuild/internal/geometry"
 
-// Mesh это 2д сетка: вершины + треуги которые просто держат индексы вершин
+// Mesh это 2д сетка: вершины + либо треуги (Triangles), либо произвольные
+// многоугольные ячейки (Cells). Какой из двух вариантов — говорит Polygonal,
+// его выставляет сам алгоритм.
+// Cells нужен для не-Делоне методов (например Вороного из заряженных частиц):
+// там ячейка — не треугольник, а многоугольник с произвольным числом вершин.
 // пока что из-за делоне у нас не гарантирован порядок обхода вершин для треугольника (по/против часовой)!!!
 type Mesh struct {
 	Vertices  []geometry.Point
-	Triangles [][3]int
+	Triangles [][3]int // индексы вершин, по 3 на треугольник
+	Cells     [][]int  // индексы вершин по кругу ячейки, по 1 срезу на многоугольник
+	Polygonal bool     // true — сетка из Cells, false — из Triangles
 }
 
 // Tri возвращаем вершины i-го треугольника
@@ -20,4 +26,14 @@ func (m Mesh) Tri(i int) (a, b, c geometry.Point) {
 func (m Mesh) Centroid(i int) geometry.Point {
 	a, b, c := m.Tri(i)
 	return geometry.Point{X: (a.X + b.X + c.X) / 3, Y: (a.Y + b.Y + c.Y) / 3}
+}
+
+// Cell возвращаем вершины i-й многоугольной ячейки, по кругу.
+func (m Mesh) Cell(i int) []geometry.Point {
+	idx := m.Cells[i]
+	out := make([]geometry.Point, len(idx))
+	for k, vi := range idx {
+		out[k] = m.Vertices[vi]
+	}
+	return out
 }

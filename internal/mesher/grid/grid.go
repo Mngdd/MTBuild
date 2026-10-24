@@ -21,7 +21,10 @@ type Mesher struct{}
 func (Mesher) Name() string { return "grid" }
 
 var paramH = mesher.ParamSpec{
-	Key: "h", Label: "Target edge length", Min: 1e-4, Max: 1e9, Def: 0.05, Step: 0.005,
+	// Max is a UI-usable ceiling, not a hard limit of the algorithm: geometry
+	// is normalized to a unit bbox before Generate ever sees it, so an edge
+	// length past 1.0 is already degenerate.
+	Key: "h", Label: "Target edge length", Min: 1e-4, Max: 1.0, Def: 0.05, Step: 0.005,
 }
 
 func (Mesher) Params() []mesher.ParamSpec { return []mesher.ParamSpec{paramH} }

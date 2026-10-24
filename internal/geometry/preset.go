@@ -1,12 +1,17 @@
 package geometry
 
 import (
+	_ "embed"
 	"fmt"
 	"math"
+	"strings"
 )
 
+//go:embed testdata/kulman.dxf
+var wingDXF string
+
 // Preset возвращает захардкоженные моим клодкодом Geometry-объекты, таким образом можно без
-// входных файлов работать для тестов. Known names: "ellipse", "zalesak"
+// входных файлов работать для тестов. Known names: "ellipse", "zalesak", "wing"
 // тут все тотально нанейрослоплено и меняться не будет ибо це тест код
 func Preset(name string) (Geometry, error) {
 	switch name {
@@ -14,6 +19,12 @@ func Preset(name string) (Geometry, error) {
 		return ellipse(1.0, 0.6, 128).Normalized()
 	case "zalesak":
 		return zalesak().Normalized()
+	case "wing":
+		g, err := LoadDXF(strings.NewReader(wingDXF))
+		if err != nil {
+			return Geometry{}, fmt.Errorf("geometry: embedded wing preset: %w", err)
+		}
+		return g.Normalized()
 	default:
 		return Geometry{}, fmt.Errorf("geometry: unknown preset %q", name)
 	}

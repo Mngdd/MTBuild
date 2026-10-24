@@ -10,6 +10,14 @@ import (
 	"MTBuild/internal/mesh"
 )
 
+// ParamKind says how a parameter is shown and read.
+type ParamKind int
+
+const (
+	KindFloat ParamKind = iota // number: slider + number box, read with Params.Get
+	KindBool                   // flag: checkbox, Def is 0 or 1, read with Params.Bool
+)
+
 // ParamSpec declares one tunable knob of an algorithm. The UI builds its
 // controls from a []ParamSpec without knowing what the algorithm does.
 type ParamSpec struct {
@@ -19,6 +27,13 @@ type ParamSpec struct {
 	Max   float64 // upper bound (inclusive)
 	Def   float64 // value used when the caller omits this key
 	Step  float64 // UI slider increment; ignored by the CLI
+	// Kind defaults to KindFloat, so every existing ParamSpec keeps working
+	// without changes.
+	Kind ParamKind
+	// DependsOn is the Key of a KindBool param in the same algorithm. The UI
+	// only shows this param while that one is checked. Purely presentational:
+	// the algorithm still has to check the flag itself before using the value.
+	DependsOn string
 }
 
 // Params carries user-supplied values keyed by ParamSpec.Key.
@@ -41,6 +56,10 @@ func (p Params) Get(spec ParamSpec) float64 {
 	}
 	return v
 }
+
+// Bool reads a KindBool parameter: true when its value is >= 0.5, so
+// "-param key=1" works from the CLI. Falls back to spec.Def like Get.
+func (p Params) Bool(spec ParamSpec) bool { return p.Get(spec) >= 0.5 }
 
 // Frame is a snapshot of intermediate state emitted during Generate, so callers
 // can visualise progress (particles relaxing, mesh forming) rather than only
