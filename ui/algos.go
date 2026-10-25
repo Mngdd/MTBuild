@@ -54,6 +54,12 @@ const rowHeight = unit.Dp(36)
 const accentWidth = unit.Dp(3)
 
 const (
+	defaultSidebarWidth = unit.Dp(240)
+	minSidebarWidth     = unit.Dp(180) // уже не сжимается — дальше только сворачивание
+	maxSidebarFraction  = 0.6          // шире этой доли окна сайдбар не растягивается
+)
+
+const (
 	listSplitGripHeight = unit.Dp(6) // ручка границы между списком алгоритмов и настройками
 	// minDetailHeight — ниже настройки не сжимаются: столько хватает на
 	// название алгоритма с плашкой, чтобы от них всегда что-то было видно.
@@ -304,7 +310,7 @@ func (s *sidebarState) detailPanel(gtx layout.Context, th *material.Theme) layou
 	return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return besideOrBelow(gtx, unit.Dp(8), unit.Dp(4),
+				return flowRow(gtx, unit.Dp(8), unit.Dp(4),
 					func(gtx layout.Context) layout.Dimensions {
 						lbl := material.Label(th, unit.Sp(14), meta.Label)
 						lbl.Font.Weight = font.Medium
@@ -330,40 +336,47 @@ func (s *sidebarState) detailPanel(gtx layout.Context, th *material.Theme) layou
 	})
 }
 
-// besideOrBelow ставит second справа от first (через gapX, по центру по
-// высоте), а если в ширину gtx они вдвоём не влезают — под ним (через gapY,
-// по левому краю). Так шапка настроек переживает узкую панель: плашка
-// уезжает на строку ниже, а не налезает на название. Возвращает размер пары.
-func besideOrBelow(gtx layout.Context, gapX, gapY unit.Dp, first, second layout.Widget) layout.Dimensions {
+// flowRow раскладывает items слева направо через gapX, по центру по высоте
+// строки, а тот, что уже не влезает в ширину gtx, переносит на новую строку
+// (через gapY). Так шапки переживают узкие панели: плашка или кнопки уезжают
+// ниже, а не налезают на соседей. Возвращает размер всего блока.
+func flowRow(gtx layout.Context, gapX, gapY unit.Dp, items ...layout.Widget) layout.Dimensions {
 	measureGtx := gtx
 	measureGtx.Constraints.Min = image.Point{}
+	gapXPx, gapYPx := gtx.Dp(gapX), gtx.Dp(gapY)
 
-	// обоих раскладываем заранее и записываем: где их ставить, зависит от
-	// суммы ширин, а она известна только после раскладки
-	firstMacro := op.Record(gtx.Ops)
-	firstDims := first(measureGtx)
-	firstCall := firstMacro.Stop()
-	secondMacro := op.Record(gtx.Ops)
-	secondDims := second(measureGtx)
-	secondCall := secondMacro.Stop()
-
-	var firstAt, secondAt, size image.Point
-	if besideWidth := firstDims.Size.X + gtx.Dp(gapX) + secondDims.Size.X; besideWidth <= gtx.Constraints.Max.X {
-		height := max(firstDims.Size.Y, secondDims.Size.Y)
-		firstAt = image.Pt(0, (height-firstDims.Size.Y)/2)
-		secondAt = image.Pt(firstDims.Size.X+gtx.Dp(gapX), (height-secondDims.Size.Y)/2)
-		size = image.Pt(besideWidth, height)
-	} else {
-		secondAt = image.Pt(0, firstDims.Size.Y+gtx.Dp(gapY))
-		size = image.Pt(max(firstDims.Size.X, secondDims.Size.X), secondAt.Y+secondDims.Size.Y)
+	// всех раскладываем заранее и записываем: в какую строку кто попадёт,
+	// зависит от ширин, а они известны только после раскладки
+	calls := make([]op.CallOp, len(items))
+	sizes := make([]image.Point, len(items))
+	for i, item := range items {
+		macro := op.Record(gtx.Ops)
+		sizes[i] = item(measureGtx).Size
+		calls[i] = macro.Stop()
 	}
 
-	offset := op.Offset(firstAt).Push(gtx.Ops)
-	firstCall.Add(gtx.Ops)
-	offset.Pop()
-	offset = op.Offset(secondAt).Push(gtx.Ops)
-	secondCall.Add(gtx.Ops)
-	offset.Pop()
+	var size image.Point
+	lineTop := 0
+	for lineStart := 0; lineStart < len(items); {
+		// сколько элементов влезает в эту строку (хотя бы один)
+		lineEnd, lineWidth, lineHeight := lineStart+1, sizes[lineStart].X, sizes[lineStart].Y
+		for lineEnd < len(items) && lineWidth+gapXPx+sizes[lineEnd].X <= gtx.Constraints.Max.X {
+			lineWidth += gapXPx + sizes[lineEnd].X
+			lineHeight = max(lineHeight, sizes[lineEnd].Y)
+			lineEnd++
+		}
+		x := 0
+		for i := lineStart; i < lineEnd; i++ {
+			offset := op.Offset(image.Pt(x, lineTop+(lineHeight-sizes[i].Y)/2)).Push(gtx.Ops)
+			calls[i].Add(gtx.Ops)
+			offset.Pop()
+			x += sizes[i].X + gapXPx
+		}
+		size.X = max(size.X, lineWidth)
+		size.Y = lineTop + lineHeight
+		lineTop = size.Y + gapYPx
+		lineStart = lineEnd
+	}
 	return layout.Dimensions{Size: size}
 }
 

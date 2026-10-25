@@ -120,6 +120,15 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// --- релаксация: попарное отталкивание + затухание ---------------------
 	vel := make([]geometry.Point, len(interior))
 	maxStep := p.Get(pMaxStep) * h // предел смещения частицы за шаг; держит систему в рамках при любых damping/n
+	// граничные заряды — только соседи для NeighborSpread, мерим внутренние
+	withBoundary := make([]geometry.Point, len(interior)+len(boundary))
+	copy(withBoundary[len(interior):], boundary)
+	interiorTarget := func(i int) float64 {
+		if i < len(interior) {
+			return h
+		}
+		return 0
+	}
 	for it := 0; it < iters; it++ {
 		if err := ctx.Err(); err != nil {
 			return mesh.Mesh{}, mesh.QualityMetrics{}, err
@@ -145,6 +154,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 			}
 			forces[i] = geometry.Point{X: fx, Y: fy}
 		}
+		var stepSum float64
 		for i := range interior {
 			vel[i].X = damping*vel[i].X + forces[i].X
 			vel[i].Y = damping*vel[i].Y + forces[i].Y
@@ -157,11 +167,20 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 				np = gn.Nearest(np) // граничные заряды почти не выпускают; редкого беглеца хватает вернуть на край
 				vel[i] = geometry.Point{}
 			}
+			stepSum += interior[i].Dist(np)
 			interior[i] = np
 		}
 		if it%10 == 0 || it == iters-1 {
+			copy(withBoundary, interior)
 			sink.Progress("relax", float64(it)/float64(iters))
-			sink.Snapshot(mesher.Frame{Stage: "relax", Iter: it, TotalIters: iters, Particles: denormAll(interior, denorm)})
+			sink.Snapshot(mesher.Frame{
+				Stage: "relax", Iter: it, TotalIters: iters, Particles: denormAll(interior, denorm),
+				Particle: mesher.ParticleMetrics{
+					MeanStep:       stepSum / float64(len(interior)) / h,
+					NeighborSpread: mesher.NeighborSpread(withBoundary, interiorTarget),
+				},
+				BuildMesh: func() (mesh.Mesh, error) { return buildCells(interior, gn, h, weldTol, denorm) },
+			})
 		}
 	}
 	if separate {
@@ -172,8 +191,29 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 
 	// --- ячейки Вороного по осевшим частицам -------------------------------
 	sink.Progress("voronoi", 0)
+	m, err := buildCells(interior, gn, h, weldTol, denorm)
+	if err != nil {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+	}
+	sink.Progress("voronoi", 1)
+	sink.Snapshot(mesher.Frame{Stage: "done", Iter: iters, Particles: m.Vertices, Mesh: &m})
+
+	// QualityMetrics — метрики для треугольной сетки, здесь неприменимы
+	// (Mesh.Triangles пуст); вызывающий проверяет Mesh.Polygonal и зовёт
+	// mesh.EvaluatePoly(m) — см. mesh.PolyQualityMetrics.
+	return m, mesh.QualityMetrics{}, nil
+}
+
+// buildCells строит ячейки Вороного вокруг частиц.
+// interior — подвижные частицы в нормированных координатах (сам срез не
+// меняется, так что годится и посреди релаксации — для живых метрик);
+// gn — нормированный контур; h — шаг ячеек; weldTol — допуск склейки вершин,
+// уже × h; denorm — перевод обратно в мировые координаты.
+// Возвращает многоугольную сетку в мировых координатах.
+func buildCells(interior []geometry.Point, gn geometry.Geometry, h, weldTol float64, denorm func(geometry.Point) geometry.Point) (mesh.Mesh, error) {
 	// Совпавшие частицы склеиваем в одну перед делоне всегда — до отражений,
 	// чтобы внутренние шли в sites ровно первыми nInterior штуками
+	// (mergeCoincident собирает новый срез, исходный не трогает)
 	interior = mergeCoincident(interior)
 	mirrors := reflectAcrossBoundary(interior, gn, reflectDist*h)
 	// sites = [внутренние | отражения]: индекс < nInterior — настоящая частица
@@ -181,7 +221,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	sites := append(append([]geometry.Point{}, interior...), mirrors...)
 	tris, err := delaunay.Triangulate(sites) // делонешим
 	if err != nil {
-		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+		return mesh.Mesh{}, err
 	}
 	// Фильтра треугольников по центроиду теперь нет: треугольник "частица + отражение"
 	// всегда наполовину снаружи, а его циркумцентр — как раз вершина на
@@ -229,19 +269,12 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 		cellSites = append(cellSites, denorm(sites[i]))
 	}
 	vertsNorm, cells := compactVertices(vertexPos, cells)
-	sink.Progress("voronoi", 1)
 
 	worldPos := make([]geometry.Point, len(vertsNorm))
 	for i, v := range vertsNorm {
 		worldPos[i] = denorm(v)
 	}
-	m := mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true, Sites: cellSites}
-	sink.Snapshot(mesher.Frame{Stage: "done", Iter: iters, Particles: worldPos, Mesh: &m})
-
-	// QualityMetrics — метрики для треугольной сетки, здесь неприменимы
-	// (Mesh.Triangles пуст); вызывающий проверяет Mesh.Polygonal и зовёт
-	// mesh.EvaluatePoly(m) — см. mesh.PolyQualityMetrics.
-	return m, mesh.QualityMetrics{}, nil
+	return mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true, Sites: cellSites}, nil
 }
 
 // reflectDist — с какого расстояния от края (× h) частицу отражаем. Ячейка

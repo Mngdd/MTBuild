@@ -70,6 +70,16 @@ type Frame struct {
 	TotalIters int              // how many iterations the stage runs (0 — not an iterative stage)
 	Particles  []geometry.Point // current point positions
 	Mesh       *mesh.Mesh       // set once a triangulation exists
+
+	// Particle — метрики частиц на итерации Iter. Заполнены только у кадров
+	// итерационных стадий (TotalIters > 0), иначе нулевые.
+	Particle ParticleMetrics
+	// BuildMesh, если не nil, строит сетку из частиц этого кадра тем же
+	// путём, что и итоговую, — для метрик качества посреди релаксации. Это
+	// дорого (триангуляция, у Вороного ещё и ячейки), поэтому алгоритм сам её
+	// не строит, а даёт вызвать тому, кому она нужна. Звать только внутри
+	// Sink.Snapshot: после возврата из него частицы уже едут дальше.
+	BuildMesh func() (mesh.Mesh, error)
 }
 
 // Sink receives progress reports and snapshots. Implementations must be safe to

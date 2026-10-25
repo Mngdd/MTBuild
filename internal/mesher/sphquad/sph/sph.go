@@ -93,8 +93,11 @@ type Result struct {
 
 // Relax moves interior particles toward the target size distribution and slides
 // surface particles along their contours to equalise boundary spacing.
+// report, if non-nil, is called every 10th iteration (and on the last) with
+// the particles and meanStep — the mean interior move of that iteration in
+// units of local h (the same number the convergence check uses).
 func Relax(ctx context.Context, ps []Particle, size SizeFn, dom Domain, contours []Contour,
-	cfg Config, report func(iter int, ps []Particle)) (Result, error) {
+	cfg Config, report func(iter int, ps []Particle, meanStep float64)) (Result, error) {
 
 	cfg = cfg.withDefaults()
 	_ = rand.New(rand.NewSource(cfg.Seed)) // reserved for future jitter
@@ -176,10 +179,14 @@ func Relax(ctx context.Context, ps []Particle, size SizeFn, dom Domain, contours
 			p.Pos = np
 		}
 
-		if report != nil && (it%10 == 0 || it == cfg.Iterations-1) {
-			report(it, ps)
+		meanStep := 0.0
+		if moved > 0 {
+			meanStep = moveSum / float64(moved)
 		}
-		if !ramp && moved > 0 && moveSum/float64(moved) < cfg.Tol {
+		if report != nil && (it%10 == 0 || it == cfg.Iterations-1) {
+			report(it, ps, meanStep)
+		}
+		if !ramp && moved > 0 && meanStep < cfg.Tol {
 			return Result{Particles: ps, Iters: it + 1, Converged: true}, nil
 		}
 	}

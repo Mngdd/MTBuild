@@ -36,7 +36,7 @@ func run(w *app.Window) error {
 	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
 	sb := newSidebarState(w)
 	rs := newRunState(w)
-	panel := newSidePanel()
+	sidebarDock := &dockPanel{edge: dockLeft, size: defaultSidebarWidth, maxFraction: maxSidebarFraction}
 
 	var ops op.Ops
 	for {
@@ -56,7 +56,7 @@ func run(w *app.Window) error {
 							return sb.geom.MenuBar(gtx, th)
 						}),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return panel.Layout(gtx,
+							return sidebarDock.Layout(gtx, minSidebarWidth,
 								func(gtx layout.Context) layout.Dimensions {
 									return sb.Layout(gtx, th, rs)
 								},

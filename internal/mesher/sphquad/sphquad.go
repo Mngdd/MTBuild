@@ -160,9 +160,26 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	}
 	res, err := sph.Relax(ctx, parts, cachedSizeAt, dom, contours,
 		sph.Config{Iterations: iters, Seed: 1, Theta: theta},
-		func(it int, ps []sph.Particle) {
+		func(it int, ps []sph.Particle, meanStep float64) {
+			positions := make([]geometry.Point, len(ps))
+			for i, pt := range ps {
+				positions[i] = pt.Pos
+			}
+			interiorTarget := func(i int) float64 { // граничные закреплены — только соседи
+				if ps[i].Kind == sph.Surface {
+					return 0
+				}
+				return ps[i].Ht
+			}
 			sink.Progress("sph-relax", float64(it)/float64(iters))
-			sink.Snapshot(mesher.Frame{Stage: "sph-relax", Iter: it, TotalIters: iters, Particles: denormAll(ps, denorm)})
+			sink.Snapshot(mesher.Frame{
+				Stage: "sph-relax", Iter: it, TotalIters: iters, Particles: denormAll(ps, denorm),
+				Particle: mesher.ParticleMetrics{
+					MeanStep:       meanStep,
+					NeighborSpread: mesher.NeighborSpread(positions, interiorTarget),
+				},
+				BuildMesh: func() (mesh.Mesh, error) { return buildTriangles(ps, gn, weldTol, smoothPasses, denorm) },
+			})
 		})
 	if err != nil {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err
@@ -171,9 +188,26 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 
 	// --- triangulate + trim ----------------------------------------
 	sink.Progress("triangulate", 0)
-	allPos := make([]geometry.Point, len(res.Particles))
-	allBoundary := make([]bool, len(res.Particles))
-	for i, pt := range res.Particles {
+	m, err := buildTriangles(res.Particles, gn, weldTol, smoothPasses, denorm)
+	if err != nil {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+	}
+	sink.Progress("triangulate", 1)
+	sink.Snapshot(mesher.Frame{Stage: "done", Iter: res.Iters, Particles: m.Vertices, Mesh: &m})
+
+	return m, mesh.Evaluate(m), nil
+}
+
+// buildTriangles turns relaxed particles into the final triangle mesh: merge
+// collapsed points, Delaunay, trim triangles outside the domain, smooth.
+// particles are in normalised space and are not modified, so this also works
+// mid-relaxation (for live quality metrics); gn is the normalised geometry,
+// weldTol the merge distance, smoothPasses the Laplacian passes, denorm maps
+// back to world space. Returns the mesh in world coordinates.
+func buildTriangles(particles []sph.Particle, gn geometry.Geometry, weldTol float64, smoothPasses int, denorm func(geometry.Point) geometry.Point) (mesh.Mesh, error) {
+	allPos := make([]geometry.Point, len(particles))
+	allBoundary := make([]bool, len(particles))
+	for i, pt := range particles {
 		allPos[i] = pt.Pos
 		allBoundary[i] = pt.Kind == sph.Surface
 	}
@@ -192,7 +226,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// world coordinates can be (e.g. kulman.dxf sits at y~2100).
 	tris, err := delaunay.Triangulate(normPos)
 	if err != nil {
-		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+		return mesh.Mesh{}, err
 	}
 	tris = trimByContains(gn, normPos, tris)
 
@@ -205,18 +239,14 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// anything. See smoothPasses' ParamSpec for the measured effect.
 	normPos, tris, err = smoothMesh(normPos, tris, isBoundary, gn, smoothPasses)
 	if err != nil {
-		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+		return mesh.Mesh{}, err
 	}
 
 	worldPos := make([]geometry.Point, len(normPos))
 	for i, pt := range normPos {
 		worldPos[i] = denorm(pt)
 	}
-	m := mesh.Mesh{Vertices: worldPos, Triangles: tris}
-	sink.Progress("triangulate", 1)
-	sink.Snapshot(mesher.Frame{Stage: "done", Iter: res.Iters, Particles: worldPos, Mesh: &m})
-
-	return m, mesh.Evaluate(m), nil
+	return mesh.Mesh{Vertices: worldPos, Triangles: tris}, nil
 }
 
 // sizer turns the (phi, psi, kappa) fields into a target element size h_t.

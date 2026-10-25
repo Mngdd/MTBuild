@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image"
 	"image/png"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -64,11 +65,14 @@ type runState struct {
 	view        meshView // последняя готовая сетка + камера просмотра
 	metrics     mesh.QualityMetrics
 	polyMetrics mesh.PolyQualityMetrics
-	polygonal   bool
+	polygonal   bool // форма сетки текущего (или последнего) запуска — известна уже при Start
+	hasFinal    bool // metrics/polyMetrics — итог последнего запуска (он дошёл до конца без ошибки)
 	err         error
 
-	progress *progressSink // текущего запуска; nil — ещё не запускали
-	title    string        // последний выставленный заголовок окна
+	progress *progressSink  // текущего запуска; nil — ещё не запускали
+	samples  []metricSample // копия истории метрик из progress, обновляется в poll
+	panel    *metricsPanel  // нижняя панель метрик под областью просмотра
+	title    string         // последний выставленный заголовок окна
 }
 
 // titleRefresh — не чаще чем раз в столько будим окно ради счётчика итераций
@@ -76,24 +80,46 @@ type runState struct {
 // расчётах это сотни перерисовок в секунду ради одной цифры.
 const titleRefresh = 100 * time.Millisecond
 
-// progressSink запоминает текущую итерацию расчёта для заголовка окна.
-// Snapshot зовётся из горутины Generate, поэтому только атомики + Invalidate;
-// сам заголовок меняется в цикле событий (runState.poll).
+// progressSink запоминает текущую итерацию расчёта для заголовка окна и
+// копит историю метрик для панели метрик. Snapshot зовётся из горутины
+// Generate, поэтому атомики и мьютекс + Invalidate; читает всё это цикл
+// событий (runState.poll).
 type progressSink struct {
 	win          *app.Window
+	liveMesh     bool         // строить ли сетку в каждом кадре ради её метрик; задан до старта, дальше только читается
 	iter         atomic.Int64 // 1..totalIters, 0 — итераций ещё не было
 	totalIters   atomic.Int64
 	lastWakeNano atomic.Int64 // когда последний раз звали Invalidate (UnixNano)
+
+	historyMutex sync.Mutex
+	history      []metricSample // по кадру на каждые 10 итераций
 }
 
 func (s *progressSink) Progress(string, float64) {}
 
-// Snapshot берёт из кадра только номер итерации и их общее число; кадры
-// неитерационных стадий (TotalIters == 0) пропускает.
+// Snapshot берёт из кадра номер итерации, их общее число и метрики частиц,
+// а с живыми метриками сетки ещё и строит по кадру сетку и меряет её —
+// прямо тут, в горутине расчёта, пока частицы стоят (этим живые метрики и
+// замедляют расчёт). Кадры неитерационных стадий (TotalIters == 0) пропускает.
 func (s *progressSink) Snapshot(f mesher.Frame) {
 	if f.TotalIters <= 0 {
 		return
 	}
+	sample := metricSample{iter: f.Iter, particle: f.Particle}
+	if s.liveMesh && f.BuildMesh != nil {
+		if m, err := f.BuildMesh(); err == nil { // не вышло — у этого кадра просто не будет метрик сетки
+			sample.hasMesh = true
+			if m.Polygonal {
+				sample.poly = mesh.EvaluatePoly(m)
+			} else {
+				sample.tri = mesh.Evaluate(m)
+			}
+		}
+	}
+	s.historyMutex.Lock()
+	s.history = append(s.history, sample)
+	s.historyMutex.Unlock()
+
 	s.iter.Store(int64(f.Iter + 1))
 	s.totalIters.Store(int64(f.TotalIters))
 	if now := time.Now().UnixNano(); now-s.lastWakeNano.Load() >= int64(titleRefresh) {
@@ -102,8 +128,16 @@ func (s *progressSink) Snapshot(f mesher.Frame) {
 	}
 }
 
+// historyCopy — копия накопленной истории метрик (Snapshot дописывает её из
+// другой горутины, так что наружу — только копия).
+func (s *progressSink) historyCopy() []metricSample {
+	s.historyMutex.Lock()
+	defer s.historyMutex.Unlock()
+	return append([]metricSample(nil), s.history...)
+}
+
 func newRunState(w *app.Window) *runState {
-	return &runState{win: w, resultCh: make(chan generateResult, 1)}
+	return &runState{win: w, resultCh: make(chan generateResult, 1), panel: newMetricsPanel()}
 }
 
 // poll drains a finished result, if any. Call it once per FrameEvent before
@@ -119,8 +153,12 @@ func (r *runState) poll() {
 			r.metrics = res.metrics
 			r.polyMetrics = res.polyMetrics
 			r.polygonal = res.polygonal
+			r.hasFinal = true
 		}
 	default:
+	}
+	if r.progress != nil {
+		r.samples = r.progress.historyCopy()
 	}
 
 	// заголовок: "MTBuild (130/300)" пока идёт итерационная стадия, иначе просто имя
@@ -142,9 +180,11 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 	}
 	r.running = true
 	r.err = nil
+	r.hasFinal = false
+	r.polygonal = algoMetas[algoName].Output == "polygonal"
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	progress := &progressSink{win: r.win}
+	progress := &progressSink{win: r.win, liveMesh: r.panel.liveMesh}
 	r.progress = progress
 
 	go func() {
@@ -211,9 +251,29 @@ func (r *runState) Layout(gtx layout.Context, th *material.Theme, algoName strin
 	)
 }
 
-// contentView fills the right-hand pane: the last rendered mesh, an error,
-// a "running" note, or an idle placeholder.
+// contentView fills the right-hand pane: the mesh view area (the last
+// rendered mesh, an error, a "running" note, or an idle placeholder) with the
+// metrics panel docked under it.
 func (r *runState) contentView(gtx layout.Context, th *material.Theme) layout.Dimensions {
+	return r.panel.Layout(gtx, th, r.metricsView(), func(gtx layout.Context) layout.Dimensions {
+		return r.viewArea(gtx, th)
+	})
+}
+
+// metricsView собирает для панели метрик то, что ей показывать сейчас.
+func (r *runState) metricsView() metricsView {
+	view := metricsView{running: r.running, polygonal: r.polygonal, samples: r.samples}
+	if r.progress != nil {
+		view.totalIters = int(r.progress.totalIters.Load())
+	}
+	if r.hasFinal {
+		view.final = &metricSample{hasMesh: true, tri: r.metrics, poly: r.polyMetrics}
+	}
+	return view
+}
+
+// viewArea — область просмотра над панелью метрик на всё место gtx.
+func (r *runState) viewArea(gtx layout.Context, th *material.Theme) layout.Dimensions {
 	gtx.Constraints.Min = gtx.Constraints.Max
 	paint.FillShape(gtx.Ops, colContentBG, clip.Rect{Max: gtx.Constraints.Min}.Op())
 
@@ -224,25 +284,7 @@ func (r *runState) contentView(gtx layout.Context, th *material.Theme) layout.Di
 		return layout.Center.Layout(gtx, lbl.Layout)
 	case r.view.hasMesh:
 		return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-					var s string
-					if r.polygonal {
-						q := r.polyMetrics
-						s = fmt.Sprintf("%d ячеек · avg_sides %.1f · iso_avg %.2f", q.Cells, q.AvgSides, q.IsoAvg)
-					} else {
-						q := r.metrics
-						s = fmt.Sprintf("%d треугольников · G_avg %.2f · θ_min %.1f°", q.Triangles, q.GAvg, q.ThetaMinDeg)
-					}
-					lbl := material.Body2(th, s)
-					lbl.Color = colTextSecond
-					return lbl.Layout(gtx)
-				}),
-				layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
-				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					return r.view.Layout(gtx, th)
-				}),
-			)
+			return r.view.Layout(gtx, th)
 		})
 	case r.running:
 		lbl := material.Body2(th, "Считаю…")
