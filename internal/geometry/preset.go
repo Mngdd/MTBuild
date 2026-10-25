@@ -11,12 +11,14 @@ import (
 var wingDXF string
 
 // Preset возвращает захардкоженные моим клодкодом Geometry-объекты, таким образом можно без
-// входных файлов работать для тестов. Known names: "ellipse", "zalesak", "wing"
+// входных файлов работать для тестов. Known names: "ellipse", "circle", "zalesak", "wing"
 // тут все тотально нанейрослоплено и меняться не будет ибо це тест код
 func Preset(name string) (Geometry, error) {
 	switch name {
 	case "ellipse":
 		return ellipse(1.0, 0.6, 128).Normalized()
+	case "circle":
+		return ellipse(1.0, 1.0, 128).Normalized()
 	case "zalesak":
 		return zalesak().Normalized()
 	case "wing":

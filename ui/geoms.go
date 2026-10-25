@@ -24,10 +24,11 @@ import (
 // geomOrder controls which of geometry.Preset's built-ins the dropdown
 // offers, and in what order. Like algoOrder, absence here means invisible
 // in the GUI even if geometry.Preset would accept the name.
-var geomOrder = []string{"ellipse", "zalesak", "wing"}
+var geomOrder = []string{"ellipse", "circle", "zalesak", "wing"}
 
 var geomLabels = map[string]string{
 	"ellipse": "Ellipse",
+	"circle":  "Circle",
 	"zalesak": "Zalesak disk",
 	"wing":    "Wing profile",
 }

@@ -24,7 +24,7 @@ import (
 
 func main() {
 	var (
-		geomArg = flag.String("geom", "ellipse", "geometry: a .dxf path, or a preset name (ellipse, zalesak)")
+		geomArg = flag.String("geom", "ellipse", "geometry: a .dxf path, or a preset name (ellipse, circle, zalesak, wing)")
 		algoArg = flag.String("algo", "", "meshing algorithm to run; empty just loads the geometry")
 		outSVG  = flag.String("svg", "", "write an SVG (geometry, or the mesh if -algo is set) to this path")
 		outMesh = flag.String("out", "", "write the mesh to this path (.obj, .json or .msh)")

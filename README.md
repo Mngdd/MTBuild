@@ -17,7 +17,7 @@ GUI:
 go run ./ui
 ```
 
-Контур (пресет `ellipse`/`zalesak`/`wing` или свой `.dxf`), алгоритм и его
+Контур (пресет `ellipse`/`circle`/`zalesak`/`wing` или свой `.dxf`), алгоритм и его
 параметры выбираются в окне — верхнее меню, список слева, слайдеры в
 детальной панели. Подробнее про сам интерфейс — [`ui/README.md`](ui/README.md).
 
@@ -104,7 +104,7 @@ internal/
     geometry.go             Point, Polyline, Geometry{Outer, Holes}; ориентация (CCW/CW), bbox, Normalized()
     contains.go             point-in-polygon (even-odd), Geometry.Contains, Nearest (снэп точки на границу)
     dxf.go                  парсер ASCII DXF: LWPOLYLINE, SPLINE (Де Бур), LINE (чейнинг в петли)
-    preset.go               встроенные фигуры: ellipse, zalesak, wing (embed кастомного DXF)
+    preset.go               встроенные фигуры: ellipse, circle, zalesak, wing (embed кастомного DXF)
 
   mesh/                    тип выходной сетки + метрики
     mesh.go                 Mesh{Vertices, Triangles, Cells, Polygonal} — флаг Polygonal ставит алгоритм
