@@ -16,9 +16,12 @@
 // Упрощения MVP: только равномерная плотность (без поля размеров и адаптации
 // по кривизне); силы считаются попарно за O(n^2) (на количествах частиц MVP
 // нормально — без пространственного хеша); ячейки Вороного строятся для
-// каждой частицы из циркумцентров Делоне с сортировкой по углу, а не через
-// нормальную структуру half-edge; циркумцентр, попавший вне домена,
-// снэпается на ближайшую точку границы вместо честного отсечения многоугольника.
+// каждой внутренней частицы (граничные заряды — только стенки для
+// релаксации, своих ячеек у них нет) из циркумцентров Делоне с сортировкой по
+// углу, а не через нормальную структуру half-edge; циркумцентр, попавший вне
+// домена, просто отбрасывается вместо честного отсечения многоугольника —
+// поэтому между сеткой и контуром остаётся щель (план — отражения частиц, как
+// в PolyMesher).
 package charge
 
 import (
@@ -49,11 +52,17 @@ var (
 	pClamp    = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
 	pMaxStep  = mesher.ParamSpec{Key: "max_step", Label: "Max step (× h)", Min: 0.05, Max: 1, Def: 0.3, Step: 0.05, DependsOn: "clamp"}
 	pSeparate = mesher.ParamSpec{Key: "separate", Label: "Push apart coincident particles", Kind: mesher.KindBool, Def: 1}
-	pIters    = mesher.ParamSpec{Key: "iters", Label: "Relaxation iterations", Min: 10, Max: 2000, Def: 300, Step: 10}
+	// Вершины ячеек ближе этого склеиваются в одну — всегда, настраивается только
+	// расстояние. Убирает ложные рёбра ~0 длины (почти "круговые" четвёрки
+	// частиц) и этим возвращает шестиугольники; при большем допуске начинают
+	// сливаться настоящие короткие рёбра и растёт число пятиугольников.
+	// Замерено на ellipse/zalesak: максимум шестиугольников около 0.02h.
+	pWeldTol = mesher.ParamSpec{Key: "weld_tol", Label: "Merge cell vertices closer than (× h)", Min: 0.0001, Max: 0.1, Def: 0.02, Step: 0.0001}
+	pIters   = mesher.ParamSpec{Key: "iters", Label: "Relaxation iterations", Min: 10, Max: 2000, Def: 300, Step: 10}
 )
 
 func (Mesher) Params() []mesher.ParamSpec {
-	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pSeparate, pIters}
+	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pSeparate, pWeldTol, pIters}
 }
 
 func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params, sink mesher.Sink) (mesh.Mesh, mesh.QualityMetrics, error) {
@@ -62,6 +71,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	k := p.Get(pK)
 	clamp := p.Bool(pClamp)
 	separate := p.Bool(pSeparate)
+	weldTol := p.Get(pWeldTol) * h
 	damping := p.Get(pDamping)
 	iters := int(p.Get(pIters))
 
@@ -165,7 +175,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// склеиваем в одну перед Делоне — всегда: в релаксации пара давила как
 	// заряд 2, а ячейка у неё одна. Сама библиотека Делоне дубли тоже молча
 	// пропускает, но полагаться на это не хотим.
-	sites := mergeCoincident(append(append([]geometry.Point{}, interior...), boundary...))
+	sites, nInterior := mergeCoincident(append(append([]geometry.Point{}, interior...), boundary...), len(interior))
 	tris, err := delaunay.Triangulate(sites) // делонешим
 	if err != nil {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err
@@ -187,38 +197,36 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// теперь для каждой частицы собираем треугольники к которым она относится
 	trisAtSite := triangleAdjacency(len(sites), tris)
 
-	// Насколько близко к границе должен оказаться циркумцентр, чтобы его
-	// просто прилепили на неё — см. комментарий к voronoiCell. 0.6h взято с
-	// запасом нарочно ("максимально тупой способ"): лучше чуть сплющить
-	// внешний ряд, чем оставить щель между сеткой и краем.
-
-	// TODO: это должно исчезнуть как только будет введено слипание частиц в общем
-	// TODO: слипание должно влиять на частицу+частицу и частица+граница
-	snapMargin := 0.6 * h
-
-	// Такие маленькие ячейки — остатки граничных частиц, зажатые между
-	// настоящим краем и первым рядом внутренних: площадь реальная, но на глаз
-	// не видна, а рой таких почти нулевых треугольников портит средние метрики
-	// формы. Выкинув их, видимую щель не откроешь (в том и смысл "не видно"),
-	// так что это чистка метрик/размера выхода, а не условие корректности, как
-	// сам факт построения ячеек для всех частиц.
+	// Отсев слишком мелких ячеек. но как будто особо не вызывается
+	// TODO: вроде как полезно но может и бесполезен стать в будущем
 	minCellArea := 0.01 * h * h
 
-	var vertsNorm []geometry.Point
-	var cells [][]int
-	for i := range sites {
-		poly := voronoiCell(sites, tris, trisAtSite[i], i, gn, snapMargin)
-		if len(poly) < 3 || polyArea(poly) < minCellArea {
-			continue // вырожденная (одна из частиц на оболочке) или слишком мелкая
+	// --- вершины Вороного: по одной на треугольник Делоне, общие для соседей ---
+	raw := make([]geometry.Point, len(tris))
+	valid := make([]bool, len(tris))
+	for ti, t := range tris {
+		c, ok := circumcenter(sites[t[0]], sites[t[1]], sites[t[2]])
+		// вырожденный или вне фигуры — эту вершину пропустят все ячейки одинаково
+		// TODO: лучше сделать отражения частиц через контур (PolyMesher хз), тогда решим проблему с генерацией на краях
+		if !ok || !gn.Contains(c) {
+			continue
 		}
-		base := len(vertsNorm)
-		vertsNorm = append(vertsNorm, poly...)
-		idx := make([]int, len(poly))
-		for k := range poly {
-			idx[k] = base + k
-		}
-		cells = append(cells, idx)
+		raw[ti], valid[ti] = c, true
 	}
+	// нихуя не понял че за коммент тут был потом перепишу понятно
+	circumcentersByTriangles := weldVertices(raw, valid, weldTol)
+
+	var cells [][]int
+	// ячейки только у внутренних: у граничного заряда после отбрасывания
+	// внешних циркумцентров остаётся мелкий кривой треугольник у края — мусор
+	for i := 0; i < nInterior; i++ {
+		cell := voronoiCell(sites[i], trisAtSite[i], raw, circumcentersByTriangles)
+		if len(cell) < 3 || polyArea(gather(raw, cell)) < minCellArea {
+			continue // у края: почти все циркумцентры вне фигуры, осталось < 3 вершин (или слишком мелкая)
+		}
+		cells = append(cells, cell)
+	}
+	vertsNorm, cells := compactVertices(raw, cells)
 	sink.Progress("voronoi", 1)
 
 	worldPos := make([]geometry.Point, len(vertsNorm))
@@ -290,11 +298,15 @@ func randomDir(rng *rand.Rand) geometry.Point {
 	return geometry.Point{X: math.Cos(a), Y: math.Sin(a)}
 }
 
-// mergeCoincident оставляет из каждой группы совпавших точек первую. O(N²),
-// но один раз за Generate — на фоне релаксации незаметно.
-func mergeCoincident(pts []geometry.Point) []geometry.Point {
+// mergeCoincident оставляет из каждой группы совпавших точек первую, порядок
+// сохраняется. nFirst — сколько точек в начале pts составляют первую группу
+// (внутренние частицы); вторым значением возвращается, сколько из них
+// осталось — они по-прежнему идут в начале результата. O(N²), но один раз за
+// Generate — на фоне релаксации незаметно.
+func mergeCoincident(pts []geometry.Point, nFirst int) ([]geometry.Point, int) {
 	out := pts[:0:0]
-	for _, p := range pts {
+	keptFirst := 0
+	for i, p := range pts {
 		dup := false
 		for _, q := range out {
 			if p.Dist(q) < coincideEps {
@@ -304,9 +316,12 @@ func mergeCoincident(pts []geometry.Point) []geometry.Point {
 		}
 		if !dup {
 			out = append(out, p)
+			if i < nFirst {
+				keptFirst++
+			}
 		}
 	}
-	return out
+	return out, keptFirst
 }
 
 // repel возвращает силу на a от одноимённого заряда b: величина k/r^n,
@@ -351,63 +366,110 @@ func triangleAdjacency(nSites int, tris [][3]int) [][]int {
 	return out
 }
 
-// voronoiCell строит ячейку Вороного частицы i из циркумцентров всех
-// треугольников Делоне, в которые она входит, упорядоченных по углу вокруг
-// частицы. Честного отсечения по контуру нет (см. описание пакета) — вместо
-// этого любой циркумцентр вне домена ИЛИ внутри, но ближе snapMargin к краю,
-// переносится на ближайшую точку границы. Без второй половины условия ячейки
-// у края до него не дотягивают и оставляют видимую щель; это самый тупой
-// фикс, чтобы они реально доставали до края, ценой сплющивания их формы у
-// самой границы.
+// voronoiCell — ячейка частицы site как список id вершин, упорядоченных по
+// углу циркумцентра вокруг частицы. circumcentersByTriangles[ti] — id вершины
+// треугольника ti после сварки (см. weldVertices), -1 — вершины нет:
+// треугольник вырожденный или его циркумцентр вне фигуры, так что ячейка у
+// края до него не дотягивает — щель до отражений (PolyMesher).
 //
-// Угол для сортировки берётся от *неперенесённого* циркумцентра, а не от
-// точки, которая реально сохраняется. Сортировка по перенесённой позиции в
-// принципе могла бы переставить несколько циркумцентров, прилипших к
-// соседним участкам кривой границы, и многоугольник пересёк бы сам себя
-// (заливка even-odd по сканлиниям в viz корректно заливает только простые
-// многоугольники). Это подозревалось как причина бага "незалитые ячейки у
-// края", но тест на самопересечение со старой сортировкой ничего не нашёл —
-// настоящей причиной было выкидывание ячеек граничных частиц (см. Generate).
-// Сортировку по настоящему направлению всё равно оставили: она правильная по
-// построению, а не по везению.
-//
-// sites: все точки, tris: сетка делоне, myTris: треуги в которых есть точка, i: idx точки, gn: контуры все aka геома, snapMargin: порог прилипания к краю
-func voronoiCell(sites []geometry.Point, tris [][3]int, myTris []int, i int, gn geometry.Geometry, snapMargin float64) []geometry.Point {
-	site := sites[i]
-	type pt struct {
-		p   geometry.Point
+// site: сама частица, myTris: треуги в которых есть точка, raw: циркумцентры
+// по индексу треугольника
+func voronoiCell(site geometry.Point, myTris []int, raw []geometry.Point, circumcentersByTriangles []int) []int {
+	type v struct {
+		id  int
 		ang float64
 	}
-
-	seen := make([]pt, 0, len(myTris)) // углы
+	vs := make([]v, 0, len(myTris)) // углы
 	for _, ti := range myTris {
-		t := tris[ti]
-		// ф-ла центра окр-ти через 3 точки. угол из центра в циркумцентр
-		c, ok := circumcenter(sites[t[0]], sites[t[1]], sites[t[2]])
-		if !ok {
+		if circumcentersByTriangles[ti] < 0 {
 			continue
 		}
-		ang := math.Atan2(c.Y-site.Y, c.X-site.X)
-		if near := gn.Nearest(c); !gn.Contains(c) || c.Dist(near) < snapMargin {
-			c = near
-		}
-		seen = append(seen, pt{p: c, ang: ang})
+		vs = append(vs, v{circumcentersByTriangles[ti], math.Atan2(raw[ti].Y-site.Y, raw[ti].X-site.X)})
 	}
 	// сортируем по углу
-	sort.Slice(seen, func(a, b int) bool { return seen[a].ang < seen[b].ang })
+	sort.Slice(vs, func(a, b int) bool { return vs[a].ang < vs[b].ang })
 
-	// прилипание тянет несколько изначально разных циркумцентров в одну или
-	// почти одну точку, и такие теперь лишние вершины тоже надо склеить
-	dedupTol := snapMargin * 0.1
-	out := make([]geometry.Point, 0, len(seen))
-	for _, s := range seen {
-		if len(out) > 0 && out[len(out)-1].Dist(s.p) < dedupTol {
+	// чуть раньше была сварка (пометили близкие) - теперь схлопываем
+	out := make([]int, 0, len(vs))
+	for _, x := range vs {
+		if len(out) == 0 || out[len(out)-1] != x.id {
+			out = append(out, x.id)
+		}
+	}
+	// края повторные типа срезать
+	if len(out) > 1 && out[0] == out[len(out)-1] {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// weldVertices — глобальная сварка: circumcentersByTriangles[i] = id вершины,
+// которая поглотила i (первая по порядку в радиусе tol), -1 для невалидных.
+// Хеш-сетка с шагом tol — соседей ищем в 3×3 клетках, O(n).
+func weldVertices(pos []geometry.Point, valid []bool, tol float64) []int {
+	circumcentersByTriangles := make([]int, len(pos))
+	if tol <= 0 {
+		// сварка выключена: каждая валидная вершина сама себе id (и без
+		// деления на ноль в ключе хеш-сетки)
+		for i := range pos {
+			circumcentersByTriangles[i] = -1
+			if valid[i] {
+				circumcentersByTriangles[i] = i
+			}
+		}
+		return circumcentersByTriangles
+	}
+	type key struct{ x, y int }
+	grid := map[key][]int{}
+	for i, p := range pos {
+		circumcentersByTriangles[i] = -1
+		if !valid[i] {
 			continue
 		}
-		out = append(out, s.p)
+		circumcentersByTriangles[i] = i
+		k := key{int(math.Floor(p.X / tol)), int(math.Floor(p.Y / tol))}
+	search:
+		for dx := -1; dx <= 1; dx++ {
+			for dy := -1; dy <= 1; dy++ {
+				for _, j := range grid[key{k.x + dx, k.y + dy}] {
+					if pos[j].Dist(p) < tol {
+						circumcentersByTriangles[i] = j
+						break search
+					}
+				}
+			}
+		}
+		if circumcentersByTriangles[i] == i {
+			grid[k] = append(grid[k], i)
+		}
 	}
-	if len(out) > 1 && out[0].Dist(out[len(out)-1]) < dedupTol {
-		out = out[:len(out)-1]
+	return circumcentersByTriangles
+}
+
+// compactVertices оставляет только вершины, на которые ссылаются ячейки, и
+// перенумеровывает ячейки под новый плотный массив.
+func compactVertices(pos []geometry.Point, cells [][]int) ([]geometry.Point, [][]int) {
+	newID := make([]int, len(pos))
+	for i := range newID {
+		newID[i] = -1
+	}
+	var verts []geometry.Point
+	for _, c := range cells {
+		for k, id := range c {
+			if newID[id] < 0 {
+				newID[id] = len(verts)
+				verts = append(verts, pos[id])
+			}
+			c[k] = newID[id]
+		}
+	}
+	return verts, cells
+}
+
+func gather(pos []geometry.Point, ids []int) []geometry.Point {
+	out := make([]geometry.Point, len(ids))
+	for k, id := range ids {
+		out[k] = pos[id]
 	}
 	return out
 }

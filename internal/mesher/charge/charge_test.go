@@ -215,8 +215,87 @@ func TestSeparateCoincident(t *testing.T) {
 func TestMergeCoincident(t *testing.T) {
 	a := geometry.Point{X: 0, Y: 0}
 	b := geometry.Point{X: 1, Y: 0}
-	got := mergeCoincident([]geometry.Point{a, b, a, b, a})
-	if len(got) != 2 {
-		t.Errorf("mergeCoincident kept %d points, want 2: %v", len(got), got)
+	// первые три — "внутренние": из них остаются a и b; хвост — дубли
+	got, nFirst := mergeCoincident([]geometry.Point{a, b, a, b, a}, 3)
+	if len(got) != 2 || nFirst != 2 {
+		t.Errorf("mergeCoincident kept %d points (%d of first group), want 2 (2): %v", len(got), nFirst, got)
+	}
+}
+
+// TestCharge_Connected — сетка связная: соседние ячейки делят вершины (а не
+// держат свои копии), каждое ребро входит не больше чем в 2 ячейки. Ребро
+// ровно одной ячейки должно лежать на контуре — пока только логируется (см.
+// TODO ниже).
+func TestCharge_Connected(t *testing.T) {
+	cases := map[string]geometry.Geometry{"circle": circle(1, 200)}
+	if z, err := geometry.Preset("zalesak"); err == nil {
+		cases["zalesak"], _ = z.Normalized()
+	} else {
+		t.Fatal(err)
+	}
+	for name, g := range cases {
+		m, _, err := Mesher{}.Generate(context.Background(), g, mesher.Params{"h": 0.09}, mesher.NopSink{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		type edge struct{ a, b int }
+		uses := map[edge]int{}
+		for _, c := range m.Cells {
+			for k := range c {
+				a, b := c[k], c[(k+1)%len(c)]
+				if a > b {
+					a, b = b, a
+				}
+				uses[edge{a, b}]++
+			}
+		}
+		onBoundary := boundaryCheck(g, m.Vertices)
+		var over, inner int
+		for e, n := range uses {
+			if n > 2 {
+				over++
+			}
+			if n == 1 && !(onBoundary(e.a) && onBoundary(e.b)) {
+				inner++
+			}
+		}
+		t.Logf("%s: cells=%d verts=%d edges=%d over2=%d innerOpen=%d", name, len(m.Cells), len(m.Vertices), len(uses), over, inner)
+		if over > 0 {
+			t.Errorf("%s: %d edges shared by more than 2 cells", name, over)
+		}
+		// TODO: вернуть в t.Errorf после отражений (PolyMesher) — пока
+		// циркумцентры вне фигуры отбрасываются, ячейки у края до него не
+		// дотягивают и такие рёбра есть заведомо.
+		if inner > 0 {
+			t.Logf("%s: %d edges belong to one cell but lie inside the shape (gap at the boundary)", name, inner)
+		}
+	}
+}
+
+// boundaryCheck — лежит ли вершина на контуре g (с точностью до 1e-9 от
+// габарита).
+func boundaryCheck(g geometry.Geometry, verts []geometry.Point) func(int) bool {
+	min, max := g.BoundingBox()
+	tol := 1e-9 * math.Max(max.X-min.X, max.Y-min.Y)
+	return func(i int) bool { return verts[i].Dist(g.Nearest(verts[i])) < tol }
+}
+
+func TestWeldVertices(t *testing.T) {
+	pos := []geometry.Point{{X: 0.2, Y: 0.2}, {X: 5, Y: 5}, {X: 0.5, Y: 0.4}, {}}
+	valid := []bool{true, true, true, false}
+	got := weldVertices(pos, valid, 1)
+	want := []int{0, 1, 0, -1}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tol=1: got %v, want %v", got, want)
+		}
+	}
+	// tol=0 — сварки нет, и не должно быть мусора от деления на ноль
+	got = weldVertices(pos, valid, 0)
+	want = []int{0, 1, 2, -1}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tol=0: got %v, want %v", got, want)
+		}
 	}
 }
