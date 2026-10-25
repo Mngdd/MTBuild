@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"image"
+	"sync/atomic"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/layout"
@@ -53,6 +55,40 @@ type runState struct {
 	polyMetrics mesh.PolyQualityMetrics
 	polygonal   bool
 	err         error
+
+	progress *progressSink // текущего запуска; nil — ещё не запускали
+	title    string        // последний выставленный заголовок окна
+}
+
+// titleRefresh — не чаще чем раз в столько будим окно ради счётчика итераций
+// в заголовке: алгоритмы отчитываются каждые 10 итераций, и на быстрых
+// расчётах это сотни перерисовок в секунду ради одной цифры.
+const titleRefresh = 100 * time.Millisecond
+
+// progressSink запоминает текущую итерацию расчёта для заголовка окна.
+// Snapshot зовётся из горутины Generate, поэтому только атомики + Invalidate;
+// сам заголовок меняется в цикле событий (runState.poll).
+type progressSink struct {
+	win          *app.Window
+	iter         atomic.Int64 // 1..totalIters, 0 — итераций ещё не было
+	totalIters   atomic.Int64
+	lastWakeNano atomic.Int64 // когда последний раз звали Invalidate (UnixNano)
+}
+
+func (s *progressSink) Progress(string, float64) {}
+
+// Snapshot берёт из кадра только номер итерации и их общее число; кадры
+// неитерационных стадий (TotalIters == 0) пропускает.
+func (s *progressSink) Snapshot(f mesher.Frame) {
+	if f.TotalIters <= 0 {
+		return
+	}
+	s.iter.Store(int64(f.Iter + 1))
+	s.totalIters.Store(int64(f.TotalIters))
+	if now := time.Now().UnixNano(); now-s.lastWakeNano.Load() >= int64(titleRefresh) {
+		s.lastWakeNano.Store(now)
+		s.win.Invalidate()
+	}
 }
 
 func newRunState(w *app.Window) *runState {
@@ -76,6 +112,18 @@ func (r *runState) poll() {
 		}
 	default:
 	}
+
+	// заголовок: "MTBuild (130/300)" пока идёт итерационная стадия, иначе просто имя
+	title := "MTBuild"
+	if r.running && r.progress != nil {
+		if total := r.progress.totalIters.Load(); total > 0 {
+			title = fmt.Sprintf("MTBuild (%d/%d)", r.progress.iter.Load(), total)
+		}
+	}
+	if title != r.title {
+		r.win.Option(app.Title(title))
+		r.title = title
+	}
 }
 
 func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.Params) {
@@ -86,6 +134,8 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 	r.err = nil
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+	progress := &progressSink{win: r.win}
+	r.progress = progress
 
 	go func() {
 		algo, err := mesher.New(algoName)
@@ -94,7 +144,7 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 			r.win.Invalidate()
 			return
 		}
-		m, metrics, err := algo.Generate(ctx, geom, params, mesher.NopSink{})
+		m, metrics, err := algo.Generate(ctx, geom, params, progress)
 		if err != nil {
 			r.resultCh <- generateResult{err: err}
 			r.win.Invalidate()

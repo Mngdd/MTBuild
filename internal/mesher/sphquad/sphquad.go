@@ -162,7 +162,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 		sph.Config{Iterations: iters, Seed: 1, Theta: theta},
 		func(it int, ps []sph.Particle) {
 			sink.Progress("sph-relax", float64(it)/float64(iters))
-			sink.Snapshot(mesher.Frame{Stage: "sph-relax", Iter: it, Particles: denormAll(ps, denorm)})
+			sink.Snapshot(mesher.Frame{Stage: "sph-relax", Iter: it, TotalIters: iters, Particles: denormAll(ps, denorm)})
 		})
 	if err != nil {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err

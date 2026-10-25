@@ -65,10 +65,11 @@ func (p Params) Bool(spec ParamSpec) bool { return p.Get(spec) >= 0.5 }
 // can visualise progress (particles relaxing, mesh forming) rather than only
 // the final result. Fields are populated as the relevant stage produces them.
 type Frame struct {
-	Stage     string           // e.g. "sph-relax"
-	Iter      int              // iteration index within the stage, if applicable
-	Particles []geometry.Point // current point positions
-	Mesh      *mesh.Mesh       // set once a triangulation exists
+	Stage      string           // e.g. "sph-relax"
+	Iter       int              // iteration index within the stage, if applicable
+	TotalIters int              // how many iterations the stage runs (0 — not an iterative stage)
+	Particles  []geometry.Point // current point positions
+	Mesh       *mesh.Mesh       // set once a triangulation exists
 }
 
 // Sink receives progress reports and snapshots. Implementations must be safe to

@@ -161,7 +161,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 		}
 		if it%10 == 0 || it == iters-1 {
 			sink.Progress("relax", float64(it)/float64(iters))
-			sink.Snapshot(mesher.Frame{Stage: "relax", Iter: it, Particles: denormAll(interior, denorm)})
+			sink.Snapshot(mesher.Frame{Stage: "relax", Iter: it, TotalIters: iters, Particles: denormAll(interior, denorm)})
 		}
 	}
 	if separate {
