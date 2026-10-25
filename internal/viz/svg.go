@@ -34,10 +34,6 @@ func (f Fitter) Tx(p geometry.Point) (float64, float64) {
 	return f.margin + (p.X-f.min.X)*f.scale, float64(f.height) - f.margin - (p.Y-f.min.Y)*f.scale
 }
 
-// Height is the pixel height NewFitter computed to match the aspect ratio of
-// the bounding box passed to it.
-func (f Fitter) Height() int { return f.height }
-
 // MeshSVG writes an SVG view of a triangulation over its geometry.
 func MeshSVG(w io.Writer, g geometry.Geometry, m mesh.Mesh, width int) error {
 	min, max := g.BoundingBox()

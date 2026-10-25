@@ -217,6 +217,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	circumcentersByTriangles := weldVertices(vertexPos, valid, weldTol)
 
 	var cells [][]int
+	var cellSites []geometry.Point // частица каждой оставленной ячейки, по индексу cells (мировые координаты)
 	// ячейки только у внутренних частиц: отражения — вспомогательные точки
 	// снаружи, их ячейки в сетку не идут
 	for i := 0; i < nInterior; i++ {
@@ -225,6 +226,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 			continue // убиваем вырожденные клетки
 		}
 		cells = append(cells, cell)
+		cellSites = append(cellSites, denorm(sites[i]))
 	}
 	vertsNorm, cells := compactVertices(vertexPos, cells)
 	sink.Progress("voronoi", 1)
@@ -233,7 +235,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	for i, v := range vertsNorm {
 		worldPos[i] = denorm(v)
 	}
-	m := mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true}
+	m := mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true, Sites: cellSites}
 	sink.Snapshot(mesher.Frame{Stage: "done", Iter: iters, Particles: worldPos, Mesh: &m})
 
 	// QualityMetrics — метрики для треугольной сетки, здесь неприменимы

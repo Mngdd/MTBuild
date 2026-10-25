@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"image"
 	"sync/atomic"
 	"time"
 
@@ -18,17 +17,11 @@ import (
 	"MTBuild/internal/geometry"
 	"MTBuild/internal/mesh"
 	"MTBuild/internal/mesher"
-	"MTBuild/internal/viz"
 )
 
-// previewWidth is the final (post-antialiasing) pixel width of the mesh
-// preview — viz.MeshImage internally rasterizes at a multiple of this and
-// downsamples, so this number is the sharpness knob, not a cost knob by
-// itself.
-const previewWidth = 1100
-
 type generateResult struct {
-	img         *image.RGBA
+	mesh        mesh.Mesh
+	geom        geometry.Geometry // контур, по которому строили — meshView рисует его поверх сетки
 	metrics     mesh.QualityMetrics
 	polyMetrics mesh.PolyQualityMetrics
 	polygonal   bool // which of metrics/polyMetrics is meaningful — mesher.Mesher.Generate always returns a zero QualityMetrics for a polygonal mesh (see internal/mesher/charge's doc comment), so this is computed here rather than inferred from metrics being non-zero
@@ -49,8 +42,7 @@ type runState struct {
 	cancel   context.CancelFunc
 	resultCh chan generateResult
 
-	hasImage    bool
-	imgOp       paint.ImageOp
+	view        meshView // последняя готовая сетка + камера просмотра
 	metrics     mesh.QualityMetrics
 	polyMetrics mesh.PolyQualityMetrics
 	polygonal   bool
@@ -96,7 +88,7 @@ func newRunState(w *app.Window) *runState {
 }
 
 // poll drains a finished result, if any. Call it once per FrameEvent before
-// laying out anything that reads running/hasImage/err.
+// laying out anything that reads running/view/err.
 func (r *runState) poll() {
 	select {
 	case res := <-r.resultCh:
@@ -104,8 +96,7 @@ func (r *runState) poll() {
 		r.cancel = nil
 		r.err = res.err
 		if res.err == nil {
-			r.imgOp = paint.NewImageOp(res.img)
-			r.hasImage = true
+			r.view.setMesh(res.mesh, res.geom)
 			r.metrics = res.metrics
 			r.polyMetrics = res.polyMetrics
 			r.polygonal = res.polygonal
@@ -152,17 +143,12 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 		}
 		// A polygonal mesher (Mesh.Cells, e.g. charge-voronoi) returns a zero
 		// QualityMetrics — that type is triangle-only — so its real numbers
-		// come from mesh.EvaluatePoly instead, and the image comes from the
-		// Cells-aware rasterizer, not MeshImage.
-		var img *image.RGBA
+		// come from mesh.EvaluatePoly instead.
 		var polyMetrics mesh.PolyQualityMetrics
 		if m.Polygonal {
-			img, err = viz.PolyMeshImage(geom, m, previewWidth)
 			polyMetrics = mesh.EvaluatePoly(m)
-		} else {
-			img, err = viz.MeshImage(geom, m, previewWidth)
 		}
-		r.resultCh <- generateResult{img: img, metrics: metrics, polyMetrics: polyMetrics, polygonal: m.Polygonal, err: err}
+		r.resultCh <- generateResult{mesh: m, geom: geom, metrics: metrics, polyMetrics: polyMetrics, polygonal: m.Polygonal}
 		r.win.Invalidate()
 	}()
 }
@@ -217,7 +203,7 @@ func (r *runState) contentView(gtx layout.Context, th *material.Theme) layout.Di
 		lbl := material.Body2(th, "Ошибка: "+r.err.Error())
 		lbl.Color = colDanger
 		return layout.Center.Layout(gtx, lbl.Layout)
-	case r.hasImage:
+	case r.view.hasMesh:
 		return layout.UniformInset(unit.Dp(16)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -235,8 +221,7 @@ func (r *runState) contentView(gtx layout.Context, th *material.Theme) layout.Di
 				}),
 				layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					img := widget.Image{Src: r.imgOp, Fit: widget.Contain, Position: layout.Center}
-					return img.Layout(gtx)
+					return r.view.Layout(gtx, th)
 				}),
 			)
 		})
