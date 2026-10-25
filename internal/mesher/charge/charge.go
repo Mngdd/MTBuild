@@ -47,7 +47,7 @@ func (Mesher) Name() string { return "charge-voronoi" }
 // алгоритма в UI ощущались одинаково.
 var (
 	pH        = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
-	pExp      = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 4, Def: 2, Step: 0.5}
+	pExp      = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 2, Step: 0.25}
 	pK        = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
 	pDamping  = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
 	pClamp    = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
