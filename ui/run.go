@@ -1,23 +1,42 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"image"
+	"image/png"
 	"sync/atomic"
 	"time"
 
 	"gioui.org/app"
 	"gioui.org/layout"
+	"gioui.org/op"
 	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
 
+	"MTBuild/data"
 	"MTBuild/internal/geometry"
 	"MTBuild/internal/mesh"
 	"MTBuild/internal/mesher"
 )
+
+// logoImage — логотип стартового экрана, декодирован один раз из вшитого PNG.
+var logoImage = paint.NewImageOp(mustDecodePNG(data.LogoPNG))
+
+// mustDecodePNG — картинка из байтов PNG. pngBytes: содержимое файла.
+// Ошибка тут — битый файл, вшитый в сам бинарник, а не что-то от
+// пользователя, поэтому паника.
+func mustDecodePNG(pngBytes []byte) image.Image {
+	img, err := png.Decode(bytes.NewReader(pngBytes))
+	if err != nil {
+		panic("ui: bad embedded PNG: " + err.Error())
+	}
+	return img
+}
 
 type generateResult struct {
 	mesh        mesh.Mesh
@@ -230,8 +249,40 @@ func (r *runState) contentView(gtx layout.Context, th *material.Theme) layout.Di
 		lbl.Color = colTextSecond
 		return layout.Center.Layout(gtx, lbl.Layout)
 	default:
-		lbl := material.Body2(th, "Нажмите Start")
-		lbl.Color = colTextSecond
-		return layout.Center.Layout(gtx, lbl.Layout)
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return idleView(gtx, th)
+		})
 	}
+}
+
+// idleView — стартовый экран до первого запуска: логотип и под ним "Нажмите
+// Start", оба по центру по горизонтали. Логотип квадратный, вдвое шире
+// надписи (но не выше, чем помещается в окно вместе с ней).
+// Возвращает размер всего блока.
+func idleView(gtx layout.Context, th *material.Theme) layout.Dimensions {
+	const logoToTextWidth = 2
+	gap := gtx.Dp(unit.Dp(12))
+
+	// Надпись раскладываем заранее и записываем: ширина логотипа считается
+	// от её ширины, а нарисовать её надо уже под логотипом.
+	labelMacro := op.Record(gtx.Ops)
+	lbl := material.Body2(th, "Нажмите Start")
+	lbl.Color = colTextSecond
+	labelDims := lbl.Layout(gtx)
+	labelCall := labelMacro.Stop()
+
+	logoSide := min(logoToTextWidth*labelDims.Size.X, gtx.Constraints.Max.Y-labelDims.Size.Y-gap)
+	logoSide = max(logoSide, 0)
+
+	return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			gtx.Constraints = layout.Exact(image.Pt(logoSide, logoSide))
+			return widget.Image{Src: logoImage, Fit: widget.Contain}.Layout(gtx)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			labelCall.Add(gtx.Ops)
+			return labelDims
+		}),
+	)
 }
