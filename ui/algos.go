@@ -6,6 +6,8 @@ import (
 
 	"gioui.org/app"
 	"gioui.org/font"
+	"gioui.org/io/event"
+	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
 	"gioui.org/op/clip"
@@ -50,7 +52,13 @@ var algoMetas = map[string]algoMeta{
 
 const rowHeight = unit.Dp(36)
 const accentWidth = unit.Dp(3)
-const sidebarWidth = unit.Dp(240)
+
+const (
+	listSplitGripHeight = unit.Dp(6) // ручка границы между списком алгоритмов и настройками
+	// minDetailHeight — ниже настройки не сжимаются: столько хватает на
+	// название алгоритма с плашкой, чтобы от них всегда что-то было видно.
+	minDetailHeight = unit.Dp(48)
+)
 
 var (
 	colSidebarBG    = color.NRGBA{R: 0xfa, G: 0xfa, B: 0xfa, A: 0xff}
@@ -78,7 +86,13 @@ type sidebarState struct {
 	clickables map[string]*widget.Clickable
 	params     *paramsState
 	geom       *geomState
-	list       widget.List
+
+	algoList   hoverScrollList // у списка алгоритмов и у настроек — свой скролл
+	detailList hoverScrollList
+	// algoListHeight — высота списка алгоритмов; границу с настройками
+	// двигают мышью за listSplit.
+	algoListHeight unit.Dp
+	listSplit      dragGrip
 }
 
 func newSidebarState(w *app.Window) *sidebarState {
@@ -88,22 +102,24 @@ func newSidebarState(w *app.Window) *sidebarState {
 		params:     newParamsState(),
 		geom:       newGeomState(w),
 	}
-	s.list.Axis = layout.Vertical
+	s.algoListHeight = rowHeight * unit.Dp(len(algoOrder)) // сначала видны все алгоритмы
+	s.algoList.Axis = layout.Vertical
+	s.detailList.Axis = layout.Vertical
 	for _, name := range algoOrder {
 		s.clickables[name] = &widget.Clickable{}
 	}
 	return s
 }
 
-// Layout renders the fixed-width sidebar: a scrollable region holding the
-// algorithm list and the detail panel (name, output badge, description,
-// parameters), and the Start/Stop row pinned to the bottom below it. The
-// scroll region exists because sph-quadtree alone has 7 sliders — on a
-// short window that easily runs taller than the screen, and without
-// scrolling it pushed Start/Stop off the bottom edge entirely.
+// Layout renders the sidebar into the width it is given (sidePanel decides
+// it): the algorithm list and the detail panel (name, output badge,
+// description, parameters) one above the other, each scrolling on its own
+// with a draggable border between them, and the Start/Stop row pinned to the
+// bottom. The detail panel needs its scroll because sph-quadtree alone has 7
+// sliders — on a short window that easily runs taller than the screen, and
+// without scrolling it pushed Start/Stop off the bottom edge entirely.
 func (s *sidebarState) Layout(gtx layout.Context, th *material.Theme, rs *runState) layout.Dimensions {
-	gtx.Constraints.Min.X = gtx.Dp(sidebarWidth)
-	gtx.Constraints.Max.X = gtx.Dp(sidebarWidth)
+	gtx.Constraints.Min.X = gtx.Constraints.Max.X
 	size := image.Pt(gtx.Constraints.Max.X, gtx.Constraints.Max.Y)
 	paint.FillShape(gtx.Ops, colSidebarBG, clip.Rect{Max: size}.Op())
 
@@ -122,21 +138,7 @@ func (s *sidebarState) Layout(gtx layout.Context, th *material.Theme, rs *runSta
 			})
 		}),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-			return material.List(th, &s.list).LayoutWidgets(gtx,
-				func(gtx layout.Context) layout.Dimensions {
-					rows := make([]layout.FlexChild, 0, len(algoOrder))
-					for _, name := range algoOrder {
-						name := name
-						rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-							return s.algoRow(gtx, th, name)
-						}))
-					}
-					return layout.Flex{Axis: layout.Vertical}.Layout(gtx, rows...)
-				},
-				func(gtx layout.Context) layout.Dimensions {
-					return s.detailPanel(gtx, th)
-				},
-			)
+			return s.splitLists(gtx, th)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -147,6 +149,94 @@ func (s *sidebarState) Layout(gtx layout.Context, th *material.Theme, rs *runSta
 		}),
 	)
 	return layout.Dimensions{Size: size}
+}
+
+// splitLists делит всё место gtx между списком алгоритмов (сверху) и
+// настройками (снизу), у каждого свой скролл, а между ними — ручка, которой
+// двигают границу. Хотя бы одна строка алгоритма и minDetailHeight настроек
+// видны всегда; ниже своего содержимого список алгоритмов не растягивается.
+// Возвращает полный размер.
+func (s *sidebarState) splitLists(gtx layout.Context, th *material.Theme) layout.Dimensions {
+	size := gtx.Constraints.Max
+	gripPx := gtx.Dp(listSplitGripHeight)
+	minAlgoPx := gtx.Dp(rowHeight)
+	maxAlgoPx := min(gtx.Dp(rowHeight)*len(algoOrder), size.Y-gripPx-gtx.Dp(minDetailHeight))
+	maxAlgoPx = max(maxAlgoPx, minAlgoPx) // окно совсем низкое — строка алгоритма важнее настроек
+	clampAlgo := func(px int) int { return min(max(px, minAlgoPx), maxAlgoPx) }
+
+	algoPx := clampAlgo(gtx.Dp(s.algoListHeight))
+	if target, dragged, _ := s.listSplit.update(gtx, layout.Vertical, float32(algoPx)); dragged {
+		algoPx = clampAlgo(int(target))
+		s.algoListHeight = unit.Dp(float32(algoPx) / gtx.Metric.PxPerDp)
+	}
+
+	// список алгоритмов
+	algoGtx := gtx
+	algoGtx.Constraints = layout.Exact(image.Pt(size.X, algoPx))
+	s.algoList.Layout(algoGtx, th, len(algoOrder), func(gtx layout.Context, i int) layout.Dimensions {
+		return s.algoRow(gtx, th, algoOrder[i])
+	})
+
+	// линия границы посередине ручки
+	lineColor, linePx := colBorder, gtx.Dp(splitLineWidth)
+	if s.listSplit.dragging() {
+		lineColor, linePx = colAccent, 2*linePx
+	}
+	lineTop := algoPx + (gripPx-linePx)/2
+	paint.FillShape(gtx.Ops, lineColor, clip.Rect{Min: image.Pt(0, lineTop), Max: image.Pt(size.X, lineTop+linePx)}.Op())
+
+	// настройки
+	detailTop := algoPx + gripPx
+	detailGtx := gtx
+	detailGtx.Constraints = layout.Exact(image.Pt(size.X, max(size.Y-detailTop, 0)))
+	offset := op.Offset(image.Pt(0, detailTop)).Push(gtx.Ops)
+	s.detailList.Layout(detailGtx, th, 1, func(gtx layout.Context, _ int) layout.Dimensions {
+		return s.detailPanel(gtx, th)
+	})
+	offset.Pop()
+
+	// ручка — последней, поверх краёв обоих списков
+	s.listSplit.layoutArea(gtx, image.Rect(0, algoPx, size.X, detailTop), pointer.CursorRowResize)
+	return layout.Dimensions{Size: size}
+}
+
+// hoverScrollList — список со скроллом, у которого полоса прокрутки видна,
+// только пока мышь над самим списком (или полосу тащат — тогда мышь может
+// и уехать за край).
+type hoverScrollList struct {
+	widget.List
+	hovered bool
+}
+
+// Layout раскладывает список на всё место gtx: length элементов, каждый
+// рисует element(gtx, i). Возвращает размер списка.
+//
+// Наведение ловит область на весь список, зарегистрированная до него: она
+// оказывается предком всего, что внутри, а предки в Gio получают события
+// вместе с детьми, так что строки и ползунки продолжают работать как раньше.
+// Место под полосу при этом зарезервировано всегда (material.List по
+// умолчанию Occupy) — прячется только её цвет, иначе содержимое прыгало бы
+// вбок при каждом наведении.
+func (l *hoverScrollList) Layout(gtx layout.Context, th *material.Theme, length int, element layout.ListElement) layout.Dimensions {
+	for {
+		ev, ok := gtx.Event(pointer.Filter{Target: l, Kinds: pointer.Enter | pointer.Leave | pointer.Cancel})
+		if !ok {
+			break
+		}
+		if e, ok := ev.(pointer.Event); ok {
+			l.hovered = e.Kind == pointer.Enter
+		}
+	}
+
+	defer clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops).Pop()
+	event.Op(gtx.Ops, l)
+
+	style := material.List(th, &l.List)
+	if !l.hovered && !l.Scrollbar.Dragging() {
+		style.Indicator.Color.A = 0
+		style.Indicator.HoverColor.A = 0
+	}
+	return style.Layout(gtx, length, element)
 }
 
 func (s *sidebarState) algoRow(gtx layout.Context, th *material.Theme, name string) layout.Dimensions {
@@ -190,6 +280,7 @@ func (s *sidebarState) algoRow(gtx layout.Context, th *material.Theme, name stri
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						return layout.Inset{Left: unit.Dp(9)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 							lbl := material.Label(th, unit.Sp(12), meta.Label)
+							lbl.MaxLines = 1 // узкая панель: обрезать с «…», а не переносить из строки фиксированной высоты
 							lbl.Color = colTextNormal
 							if selected {
 								lbl.Color = colAccent
@@ -210,42 +301,70 @@ func (s *sidebarState) detailPanel(gtx layout.Context, th *material.Theme) layou
 	meta := algoMetas[s.selected]
 	gtx.Constraints.Min.X = gtx.Constraints.Max.X
 
-	return layout.Stack{}.Layout(gtx,
-		layout.Expanded(func(gtx layout.Context) layout.Dimensions {
-			paint.FillShape(gtx.Ops, colBorder, clip.Rect{Max: image.Pt(gtx.Constraints.Min.X, gtx.Dp(1))}.Op())
-			return layout.Dimensions{Size: gtx.Constraints.Min}
-		}),
-		layout.Stacked(func(gtx layout.Context) layout.Dimensions {
-			return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								lbl := material.Label(th, unit.Sp(14), meta.Label)
-								lbl.Font.Weight = font.Medium
-								lbl.Color = colTextNormal
-								return lbl.Layout(gtx)
-							}),
-							layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout),
-							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-								return outputBadge(gtx, th, meta.Output)
-							}),
-						)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						lbl := material.Label(th, unit.Sp(12), meta.Description)
-						lbl.Color = colTextSecond
+	return layout.UniformInset(unit.Dp(12)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return besideOrBelow(gtx, unit.Dp(8), unit.Dp(4),
+					func(gtx layout.Context) layout.Dimensions {
+						lbl := material.Label(th, unit.Sp(14), meta.Label)
+						lbl.Font.Weight = font.Medium
+						lbl.Color = colTextNormal
 						return lbl.Layout(gtx)
-					}),
-					layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
-					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-						return s.paramsList(gtx, th)
-					}),
+					},
+					func(gtx layout.Context) layout.Dimensions {
+						return outputBadge(gtx, th, meta.Output)
+					},
 				)
-			})
-		}),
-	)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Label(th, unit.Sp(12), meta.Description)
+				lbl.Color = colTextSecond
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return s.paramsList(gtx, th)
+			}),
+		)
+	})
+}
+
+// besideOrBelow ставит second справа от first (через gapX, по центру по
+// высоте), а если в ширину gtx они вдвоём не влезают — под ним (через gapY,
+// по левому краю). Так шапка настроек переживает узкую панель: плашка
+// уезжает на строку ниже, а не налезает на название. Возвращает размер пары.
+func besideOrBelow(gtx layout.Context, gapX, gapY unit.Dp, first, second layout.Widget) layout.Dimensions {
+	measureGtx := gtx
+	measureGtx.Constraints.Min = image.Point{}
+
+	// обоих раскладываем заранее и записываем: где их ставить, зависит от
+	// суммы ширин, а она известна только после раскладки
+	firstMacro := op.Record(gtx.Ops)
+	firstDims := first(measureGtx)
+	firstCall := firstMacro.Stop()
+	secondMacro := op.Record(gtx.Ops)
+	secondDims := second(measureGtx)
+	secondCall := secondMacro.Stop()
+
+	var firstAt, secondAt, size image.Point
+	if besideWidth := firstDims.Size.X + gtx.Dp(gapX) + secondDims.Size.X; besideWidth <= gtx.Constraints.Max.X {
+		height := max(firstDims.Size.Y, secondDims.Size.Y)
+		firstAt = image.Pt(0, (height-firstDims.Size.Y)/2)
+		secondAt = image.Pt(firstDims.Size.X+gtx.Dp(gapX), (height-secondDims.Size.Y)/2)
+		size = image.Pt(besideWidth, height)
+	} else {
+		secondAt = image.Pt(0, firstDims.Size.Y+gtx.Dp(gapY))
+		size = image.Pt(max(firstDims.Size.X, secondDims.Size.X), secondAt.Y+secondDims.Size.Y)
+	}
+
+	offset := op.Offset(firstAt).Push(gtx.Ops)
+	firstCall.Add(gtx.Ops)
+	offset.Pop()
+	offset = op.Offset(secondAt).Push(gtx.Ops)
+	secondCall.Add(gtx.Ops)
+	offset.Pop()
+	return layout.Dimensions{Size: size}
 }
 
 // paramsList renders the selected algorithm's ParamSpecs as slider+number

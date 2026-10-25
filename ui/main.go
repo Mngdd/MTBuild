@@ -36,6 +36,7 @@ func run(w *app.Window) error {
 	th.Shaper = text.NewShaper(text.WithCollection(gofont.Collection()))
 	sb := newSidebarState(w)
 	rs := newRunState(w)
+	panel := newSidePanel()
 
 	var ops op.Ops
 	for {
@@ -55,13 +56,13 @@ func run(w *app.Window) error {
 							return sb.geom.MenuBar(gtx, th)
 						}),
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
-								layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return panel.Layout(gtx,
+								func(gtx layout.Context) layout.Dimensions {
 									return sb.Layout(gtx, th, rs)
-								}),
-								layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+								},
+								func(gtx layout.Context) layout.Dimensions {
 									return rs.contentView(gtx, th)
-								}),
+								},
 							)
 						}),
 					)
