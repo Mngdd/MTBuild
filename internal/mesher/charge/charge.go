@@ -18,10 +18,11 @@
 // нормально — без пространственного хеша); ячейки Вороного строятся для
 // каждой внутренней частицы (граничные заряды — только стенки для
 // релаксации, своих ячеек у них нет) из циркумцентров Делоне с сортировкой по
-// углу, а не через нормальную структуру half-edge; циркумцентр, попавший вне
-// домена, просто отбрасывается вместо честного отсечения многоугольника —
-// поэтому между сеткой и контуром остаётся щель (план — отражения частиц, как
-// в PolyMesher).
+// углу, а не через нормальную структуру half-edge. Вместо честного отсечения
+// ячеек по контуру частицы у края отражаются через него (как в PolyMesher):
+// граница между частицей и её отражением сама ложится на контур. Отражение
+// одно — через ближайшую точку контура, поэтому в углах ячейки срезаны (там
+// вершины просто прижимаются к контуру).
 package charge
 
 import (
@@ -171,28 +172,20 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 
 	// --- ячейки Вороного по осевшим частицам -------------------------------
 	sink.Progress("voronoi", 0)
-	// Совпавшие частицы (separate выключен, или разлёт не нашёл места внутри)
-	// склеиваем в одну перед Делоне — всегда: в релаксации пара давила как
-	// заряд 2, а ячейка у неё одна. Сама библиотека Делоне дубли тоже молча
-	// пропускает, но полагаться на это не хотим.
-	sites, nInterior := mergeCoincident(append(append([]geometry.Point{}, interior...), boundary...), len(interior))
+	// Совпавшие частицы склеиваем в одну перед делоне всегда — до отражений,
+	// чтобы внутренние шли в sites ровно первыми nInterior штуками
+	interior = mergeCoincident(interior)
+	mirrors := reflectAcrossBoundary(interior, gn, reflectDist*h)
+	// sites = [внутренние | отражения]: индекс < nInterior — настоящая частица
+	nInterior := len(interior)
+	sites := append(append([]geometry.Point{}, interior...), mirrors...)
 	tris, err := delaunay.Triangulate(sites) // делонешим
 	if err != nil {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err
 	}
-	// тут надо вырезать треугольники чьи центроиды (всегда внутри треуга) не внутри формы
-	// иначе получим что мы вылезем за форму. циркумцентр не подходит тк мб вне треуга
-	validTris := tris[:0]
-	for _, t := range tris {
-		c := geometry.Point{
-			X: (sites[t[0]].X + sites[t[1]].X + sites[t[2]].X) / 3,
-			Y: (sites[t[0]].Y + sites[t[1]].Y + sites[t[2]].Y) / 3,
-		}
-		if gn.Contains(c) {
-			validTris = append(validTris, t)
-		}
-	}
-	tris = validTris
+	// Фильтра треугольников по центроиду теперь нет: треугольник "частица + отражение"
+	// всегда наполовину снаружи, а его циркумцентр — как раз вершина на
+	// контуре. Ошибочное соединение вершин через прорезь теперь контрится отражениями!
 
 	// теперь для каждой частицы собираем треугольники к которым она относится
 	trisAtSite := triangleAdjacency(len(sites), tris)
@@ -202,31 +195,38 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	minCellArea := 0.01 * h * h
 
 	// --- вершины Вороного: по одной на треугольник Делоне, общие для соседей ---
-	raw := make([]geometry.Point, len(tris))
+	// тут все треуги (с учетом тех которые появились после отражения)
+	circumcenters := make([]geometry.Point, len(tris)) // тупо все циркумы
+	vertexPos := make([]geometry.Point, len(tris))     // тут все внутренние + проекция на грань внешних циркумов
 	valid := make([]bool, len(tris))
 	for ti, t := range tris {
 		c, ok := circumcenter(sites[t[0]], sites[t[1]], sites[t[2]])
-		// вырожденный или вне фигуры — эту вершину пропустят все ячейки одинаково
-		// TODO: лучше сделать отражения частиц через контур (PolyMesher хз), тогда решим проблему с генерацией на краях
-		if !ok || !gn.Contains(c) {
-			continue
+		if !ok {
+			continue // вырожденный — эту вершину пропустят все ячейки одинаково
 		}
-		raw[ti], valid[ti] = c, true
+		circumcenters[ti], vertexPos[ti], valid[ti] = c, c, true
+		// Вершина между частицей и отражением лежит на контуре (на прямой
+		// стенке — точно, на кривой — почти): прижимаем, чтобы край сетки шёл
+		// ровно по контуру. Так же — любую вершину снаружи (у углов, где
+		// отражение одно, а нужно два).
+		if usesMirror(t, nInterior) || !gn.Contains(c) {
+			vertexPos[ti] = gn.Nearest(c)
+		}
 	}
-	// нихуя не понял че за коммент тут был потом перепишу понятно
-	circumcentersByTriangles := weldVertices(raw, valid, weldTol)
+	// тут свариваем микротреугольники в "один" просто дав им один номер (kinda)
+	circumcentersByTriangles := weldVertices(vertexPos, valid, weldTol)
 
 	var cells [][]int
-	// ячейки только у внутренних: у граничного заряда после отбрасывания
-	// внешних циркумцентров остаётся мелкий кривой треугольник у края — мусор
+	// ячейки только у внутренних частиц: отражения — вспомогательные точки
+	// снаружи, их ячейки в сетку не идут
 	for i := 0; i < nInterior; i++ {
-		cell := voronoiCell(sites[i], trisAtSite[i], raw, circumcentersByTriangles)
-		if len(cell) < 3 || polyArea(gather(raw, cell)) < minCellArea {
-			continue // у края: почти все циркумцентры вне фигуры, осталось < 3 вершин (или слишком мелкая)
+		cell := voronoiCell(sites[i], trisAtSite[i], circumcenters, circumcentersByTriangles)
+		if len(cell) < 3 || polyArea(gather(vertexPos, cell)) < minCellArea {
+			continue // убиваем вырожденные клетки
 		}
 		cells = append(cells, cell)
 	}
-	vertsNorm, cells := compactVertices(raw, cells)
+	vertsNorm, cells := compactVertices(vertexPos, cells)
 	sink.Progress("voronoi", 1)
 
 	worldPos := make([]geometry.Point, len(vertsNorm))
@@ -240,6 +240,44 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// (Mesh.Triangles пуст); вызывающий проверяет Mesh.Polygonal и зовёт
 	// mesh.EvaluatePoly(m) — см. mesh.PolyQualityMetrics.
 	return m, mesh.QualityMetrics{}, nil
+}
+
+// reflectDist — с какого расстояния от края (× h) частицу отражаем. Ячейка
+// частицы ~0.6h в радиусе, так что дальше ~h отражение её уже не касается;
+// 1.5h — с запасом, как в PolyMesher.
+const reflectDist = 1.5
+
+// reflectAcrossBoundary — отражения частиц у края через контур (как в
+// PolyMesher): для каждой частицы ближе maxDist к контуру — точка
+// p' = 2q − p, где q — ближайшая к ней точка контура. Серединный
+// перпендикуляр к p–p' проходит через q по касательной к контуру, так что
+// граница между ячейкой частицы и ячейкой её отражения сама ложится на край.
+// Отражение, попавшее внутрь фигуры (у вогнутых углов и в узких местах),
+// выкидываем — иначе оно отъест кусок у настоящих ячеек. Частица ровно на
+// контуре отражения не даёт: оно совпало бы с ней самой.
+//
+// particles: внутренние частицы, gn: фигура (нормированная), maxDist: порог
+// расстояния до контура. Возвращает отражения (порядок — как у particles,
+// без пропущенных); связи "отражение -> частица" не хранится, она не нужна.
+func reflectAcrossBoundary(particles []geometry.Point, gn geometry.Geometry, maxDist float64) []geometry.Point {
+	var mirrors []geometry.Point
+	for _, p := range particles {
+		q := gn.Nearest(p)
+		if d := p.Dist(q); d >= maxDist || d < coincideEps {
+			continue
+		}
+		mirror := geometry.Point{X: 2*q.X - p.X, Y: 2*q.Y - p.Y}
+		if gn.Contains(mirror) {
+			continue
+		}
+		mirrors = append(mirrors, mirror)
+	}
+	return mirrors
+}
+
+// usesMirror — есть ли в треугольнике отражение (палим чисто по индексу в какой "половине" массива)
+func usesMirror(t [3]int, nInterior int) bool {
+	return t[0] >= nInterior || t[1] >= nInterior || t[2] >= nInterior
 }
 
 // coincideEps — расстояние, на котором частицы считаются совпавшими: repel
@@ -298,15 +336,14 @@ func randomDir(rng *rand.Rand) geometry.Point {
 	return geometry.Point{X: math.Cos(a), Y: math.Sin(a)}
 }
 
-// mergeCoincident оставляет из каждой группы совпавших точек первую, порядок
-// сохраняется. nFirst — сколько точек в начале pts составляют первую группу
-// (внутренние частицы); вторым значением возвращается, сколько из них
-// осталось — они по-прежнему идут в начале результата. O(N²), но один раз за
-// Generate — на фоне релаксации незаметно.
-func mergeCoincident(pts []geometry.Point, nFirst int) ([]geometry.Point, int) {
+// mergeCoincident оставляет из каждой группы совпавших (ближе coincideEps)
+// точек первую, порядок сохраняется. O(N²), но один раз за Generate — на фоне
+// релаксации незаметно.
+//
+// pts: точки (не меняется). Возвращает новый срез без дублей.
+func mergeCoincident(pts []geometry.Point) []geometry.Point {
 	out := pts[:0:0]
-	keptFirst := 0
-	for i, p := range pts {
+	for _, p := range pts {
 		dup := false
 		for _, q := range out {
 			if p.Dist(q) < coincideEps {
@@ -316,12 +353,9 @@ func mergeCoincident(pts []geometry.Point, nFirst int) ([]geometry.Point, int) {
 		}
 		if !dup {
 			out = append(out, p)
-			if i < nFirst {
-				keptFirst++
-			}
 		}
 	}
-	return out, keptFirst
+	return out
 }
 
 // repel возвращает силу на a от одноимённого заряда b: величина k/r^n,
@@ -368,9 +402,8 @@ func triangleAdjacency(nSites int, tris [][3]int) [][]int {
 
 // voronoiCell — ячейка частицы site как список id вершин, упорядоченных по
 // углу циркумцентра вокруг частицы. circumcentersByTriangles[ti] — id вершины
-// треугольника ti после сварки (см. weldVertices), -1 — вершины нет:
-// треугольник вырожденный или его циркумцентр вне фигуры, так что ячейка у
-// края до него не дотягивает — щель до отражений (PolyMesher).
+// треугольника ti после сварки (см. weldVertices), -1 — треугольник
+// вырожденный, вершины нет.
 //
 // site: сама частица, myTris: треуги в которых есть точка, raw: циркумцентры
 // по индексу треугольника

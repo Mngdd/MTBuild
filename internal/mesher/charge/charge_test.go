@@ -215,17 +215,16 @@ func TestSeparateCoincident(t *testing.T) {
 func TestMergeCoincident(t *testing.T) {
 	a := geometry.Point{X: 0, Y: 0}
 	b := geometry.Point{X: 1, Y: 0}
-	// первые три — "внутренние": из них остаются a и b; хвост — дубли
-	got, nFirst := mergeCoincident([]geometry.Point{a, b, a, b, a}, 3)
-	if len(got) != 2 || nFirst != 2 {
-		t.Errorf("mergeCoincident kept %d points (%d of first group), want 2 (2): %v", len(got), nFirst, got)
+	got := mergeCoincident([]geometry.Point{a, b, a, b, a})
+	if len(got) != 2 || got[0] != a || got[1] != b {
+		t.Errorf("mergeCoincident = %v, want [a b]", got)
 	}
 }
 
 // TestCharge_Connected — сетка связная: соседние ячейки делят вершины (а не
-// держат свои копии), каждое ребро входит не больше чем в 2 ячейки. Ребро
-// ровно одной ячейки должно лежать на контуре — пока только логируется (см.
-// TODO ниже).
+// держат свои копии), каждое ребро входит не больше чем в 2 ячейки, а ребро
+// ровно одной ячейки лежит на контуре. Ребро одной ячейки внутри фигуры —
+// щель между сеткой и краем или дырка между ячейками.
 func TestCharge_Connected(t *testing.T) {
 	cases := map[string]geometry.Geometry{"circle": circle(1, 200)}
 	if z, err := geometry.Preset("zalesak"); err == nil {
@@ -263,11 +262,8 @@ func TestCharge_Connected(t *testing.T) {
 		if over > 0 {
 			t.Errorf("%s: %d edges shared by more than 2 cells", name, over)
 		}
-		// TODO: вернуть в t.Errorf после отражений (PolyMesher) — пока
-		// циркумцентры вне фигуры отбрасываются, ячейки у края до него не
-		// дотягивают и такие рёбра есть заведомо.
 		if inner > 0 {
-			t.Logf("%s: %d edges belong to one cell but lie inside the shape (gap at the boundary)", name, inner)
+			t.Errorf("%s: %d edges belong to one cell but lie inside the shape (gap at the boundary)", name, inner)
 		}
 	}
 }
@@ -297,5 +293,33 @@ func TestWeldVertices(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("tol=0: got %v, want %v", got, want)
 		}
+	}
+}
+
+func TestReflectAcrossBoundary(t *testing.T) {
+	square := geometry.Geometry{Outer: geometry.Polyline{{X: -1, Y: -1}, {X: 1, Y: -1}, {X: 1, Y: 1}, {X: -1, Y: 1}}}
+
+	// у правой стенки — симметричная точка снаружи
+	got := reflectAcrossBoundary([]geometry.Point{{X: 0.9, Y: 0.2}}, square, 0.3)
+	if len(got) != 1 || got[0].Dist(geometry.Point{X: 1.1, Y: 0.2}) > 1e-12 {
+		t.Errorf("near the wall: got %v, want [(1.1, 0.2)]", got)
+	}
+	// ровно на контуре — отражение совпало бы с самой частицей, не делаем
+	if got := reflectAcrossBoundary([]geometry.Point{{X: 1, Y: 0.2}}, square, 0.3); len(got) != 0 {
+		t.Errorf("on the contour: got %v, want none", got)
+	}
+	// дальше порога — отражения нет
+	if got := reflectAcrossBoundary([]geometry.Point{{X: 0, Y: 0}}, square, 0.3); len(got) != 0 {
+		t.Errorf("far from the wall: got %v, want none", got)
+	}
+
+	// узкая дырка шириной 0.1: отражение частицы через её левую стенку
+	// перелетает дырку и попадает обратно в фигуру — его надо выкинуть
+	slotted := geometry.Geometry{
+		Outer: square.Outer,
+		Holes: []geometry.Polyline{{{X: 0, Y: -0.5}, {X: 0.1, Y: -0.5}, {X: 0.1, Y: 0.5}, {X: 0, Y: 0.5}}},
+	}
+	if got := reflectAcrossBoundary([]geometry.Point{{X: -0.15, Y: 0}}, slotted, 0.3); len(got) != 0 {
+		t.Errorf("mirror across a thin hole lands inside the shape and must be dropped, got %v", got)
 	}
 }
