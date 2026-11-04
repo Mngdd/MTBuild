@@ -20,9 +20,10 @@
 // релаксации, своих ячеек у них нет) из циркумцентров Делоне с сортировкой по
 // углу, а не через нормальную структуру half-edge. Вместо честного отсечения
 // ячеек по контуру частицы у края отражаются через него (как в PolyMesher):
-// граница между частицей и её отражением сама ложится на контур. Отражение
-// одно — через ближайшую точку контура, поэтому в углах ячейки срезаны (там
-// вершины просто прижимаются к контуру).
+// граница между частицей и её отражением сама ложится на контур. Вершины,
+// оказавшиеся снаружи, просто прижимаются к контуру, поэтому точно в угол
+// контура вершина не попадает. После релаксации несколько итераций
+// Ллойда (lloydStep) выравнивают ячейки, силы дают только начальную расстановку.
 package charge
 
 import (
@@ -46,13 +47,20 @@ func (Mesher) Name() string { return "charge-voronoi" }
 // Параметры — в долях габарита геометрии, как у sph-quadtree, чтобы оба
 // алгоритма в UI ощущались одинаково.
 var (
-	pH        = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
-	pExp      = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 2, Step: 0.25}
-	pK        = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
-	pDamping  = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
-	pClamp    = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
-	pMaxStep  = mesher.ParamSpec{Key: "max_step", Label: "Max step (× h)", Min: 0.05, Max: 1, Def: 0.3, Step: 0.05, DependsOn: "clamp"}
-	pSeparate = mesher.ParamSpec{Key: "separate", Label: "Push apart coincident particles", Kind: mesher.KindBool, Def: 1}
+	pH       = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
+	pExp     = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 3, Step: 0.25}
+	pK       = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
+	pDamping = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
+	pClamp   = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
+	pMaxStep = mesher.ParamSpec{Key: "max_step", Label: "Max step (× h)", Min: 0.05, Max: 1, Def: 0.3, Step: 0.05, DependsOn: "clamp"}
+	// Без затухания предел шага не отпускает: сила ~1/h^n на порядки больше него,
+	// каждая частица до конца шагает ровно на max_step и не оседает, а итоговая
+	// сетка — снимок этого дрожания. Гасим предел линейно к нулю.
+	pStepDecay = mesher.ParamSpec{Key: "step_decay", Label: "Decay step limit to zero", Kind: mesher.KindBool, Def: 1, DependsOn: "clamp"}
+	// Шаг кольца граничных зарядов. Сдвигает баланс плотности край/середина:
+	// замерено на zalesak и эллипсе, 1h при n=3 ровнее старых 0.5h при n=2.
+	pBoundaryStep = mesher.ParamSpec{Key: "boundary_step", Label: "Boundary charge spacing (× h)", Min: 0.25, Max: 2, Def: 1, Step: 0.05}
+	pSeparate     = mesher.ParamSpec{Key: "separate", Label: "Push apart coincident particles", Kind: mesher.KindBool, Def: 1}
 	// Вершины ячеек ближе этого склеиваются в одну — всегда, настраивается только
 	// расстояние. Убирает ложные рёбра ~0 длины (почти "круговые" четвёрки
 	// частиц) и этим возвращает шестиугольники; при большем допуске начинают
@@ -60,10 +68,15 @@ var (
 	// Замерено на ellipse/zalesak: максимум шестиугольников около 0.02h.
 	pWeldTol = mesher.ParamSpec{Key: "weld_tol", Label: "Merge cell vertices closer than (× h)", Min: 0.0001, Max: 0.1, Def: 0.02, Step: 0.0001}
 	pIters   = mesher.ParamSpec{Key: "iters", Label: "Relaxation iterations", Min: 10, Max: 2000, Def: 300, Step: 10}
+	// Итерации Ллойда после релаксации: частица -> центр масс своей ячейки.
+	// Выравнивают площади у края. 30 — с запасом: на zalesak при 10 частица,
+	// прижатая к контуру, ещё не успевает уйти (площади 0.40..0.99 h², при 30 —
+	// 0.64..0.99). 0 — выключено.
+	pLloydIters = mesher.ParamSpec{Key: "lloyd_iters", Label: "Lloyd iterations (0 = off)", Min: 0, Max: 100, Def: 30, Step: 1}
 )
 
 func (Mesher) Params() []mesher.ParamSpec {
-	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pSeparate, pWeldTol, pIters}
+	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pStepDecay, pBoundaryStep, pSeparate, pWeldTol, pIters, pLloydIters}
 }
 
 func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params, sink mesher.Sink) (mesh.Mesh, mesh.QualityMetrics, error) {
@@ -71,10 +84,14 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	expo := p.Get(pExp)
 	k := p.Get(pK)
 	clamp := p.Bool(pClamp)
+	stepDecay := p.Bool(pStepDecay)
+	boundaryStep := p.Get(pBoundaryStep) * h
 	separate := p.Bool(pSeparate)
 	weldTol := p.Get(pWeldTol) * h
 	damping := p.Get(pDamping)
 	iters := int(p.Get(pIters))
+	lloydIters := int(p.Get(pLloydIters))
+	totalIters := iters + lloydIters
 
 	// --- нормализация в единичный габарит, как у sph-quadtree --------------
 	min, max := g.BoundingBox()
@@ -95,16 +112,12 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	gn := mapGeometry(g, norm)
 
 	// --- инишал спавн частиц: фиксированные граничные заряды + подвижные внутренние ------
-	// Граничные заряды ставятся вдвое плотнее шага внутренних (0.5h, а не h):
-	// ниже нет честного отсечения ячеек по контуру, и ограничивать веер
-	// треугольников Делоне у внутренних частиц приходится одному лишь плотному
-	// кольцу граничных. Замерено на круге: при шаге кольца h ячейки у самого
-	// края выходят слиперами (IsoAvg 0.73, IsoMin 0.06), при h/2 — чистые
-	// (IsoAvg 0.85, IsoMin 0.79) при том же посеве внутренних.
+	// Граничные заряды — только стенки для релаксации: в ячейки они не идут, до
+	// контура сетку дотягивают отражения (см. buildCells).
 	sink.Progress("init", 0)
-	boundary := resampleBoundary(gn.Outer, 0.5*h) // сыпем у границ
+	boundary := resampleBoundary(gn.Outer, boundaryStep) // сыпем у границ
 	for _, hole := range gn.Holes {
-		boundary = append(boundary, resampleBoundary(hole, 0.5*h)...)
+		boundary = append(boundary, resampleBoundary(hole, boundaryStep)...)
 	}
 	rng := rand.New(rand.NewSource(1))
 	interior := interiorLattice(gn, h, rng) // сыпем внутрянку
@@ -155,12 +168,16 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 			forces[i] = geometry.Point{X: fx, Y: fy}
 		}
 		var stepSum float64
+		stepLimit := maxStep
+		if stepDecay {
+			stepLimit = maxStep * (1 - float64(it)/float64(iters))
+		}
 		for i := range interior {
 			vel[i].X = damping*vel[i].X + forces[i].X
 			vel[i].Y = damping*vel[i].Y + forces[i].Y
 			vel[i] = sanitise(vel[i])
 			if clamp {
-				vel[i] = clampMag(vel[i], maxStep)
+				vel[i] = clampMag(vel[i], stepLimit)
 			}
 			np := geometry.Point{X: interior[i].X + vel[i].X, Y: interior[i].Y + vel[i].Y}
 			if !gn.Contains(np) {
@@ -174,7 +191,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 			copy(withBoundary, interior)
 			sink.Progress("relax", float64(it)/float64(iters))
 			sink.Snapshot(mesher.Frame{
-				Stage: "relax", Iter: it, TotalIters: iters, Particles: denormAll(interior, denorm),
+				Stage: "relax", Iter: it, TotalIters: totalIters, Particles: denormAll(interior, denorm),
 				Particle: mesher.ParticleMetrics{
 					MeanStep:       stepSum / float64(len(interior)) / h,
 					NeighborSpread: mesher.NeighborSpread(withBoundary, interiorTarget),
@@ -189,11 +206,42 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	}
 	sink.Progress("relax", 1)
 
+	// --- итерации Ллойда: выравниваем ячейки ---------------------------------
+	// Номера итераций продолжают релаксацию, чтобы счётчик и графики метрик шли подряд.
+	for it := 0; it < lloydIters; it++ {
+		if err := ctx.Err(); err != nil {
+			return mesh.Mesh{}, mesh.QualityMetrics{}, err
+		}
+		moved, err := lloydStep(interior, gn, h, weldTol)
+		if err != nil {
+			return mesh.Mesh{}, mesh.QualityMetrics{}, err
+		}
+		var stepSum float64
+		for i := range interior {
+			stepSum += interior[i].Dist(moved[i])
+		}
+		interior = moved
+		copy(withBoundary, interior)
+		sink.Progress("lloyd", float64(it)/float64(lloydIters))
+		sink.Snapshot(mesher.Frame{
+			Stage: "lloyd", Iter: iters + it, TotalIters: totalIters, Particles: denormAll(interior, denorm),
+			Particle: mesher.ParticleMetrics{
+				MeanStep:       stepSum / float64(len(interior)) / h,
+				NeighborSpread: mesher.NeighborSpread(withBoundary, interiorTarget),
+			},
+			BuildMesh: func() (mesh.Mesh, error) { return buildCells(interior, gn, h, weldTol, denorm) },
+		})
+	}
+	sink.Progress("lloyd", 1)
+
 	// --- ячейки Вороного по осевшим частицам -------------------------------
 	sink.Progress("voronoi", 0)
 	m, err := buildCells(interior, gn, h, weldTol, denorm)
 	if err != nil {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err
+	}
+	if len(m.Cells) == 0 {
+		return mesh.Mesh{}, mesh.QualityMetrics{}, errNoCells
 	}
 	sink.Progress("voronoi", 1)
 	sink.Snapshot(mesher.Frame{Stage: "done", Iter: iters, Particles: m.Vertices, Mesh: &m})
@@ -277,37 +325,138 @@ func buildCells(interior []geometry.Point, gn geometry.Geometry, h, weldTol floa
 	return mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true, Sites: cellSites}, nil
 }
 
+// lloydStep — одна итерация Ллойда: строит ячейки и переставляет каждую частицу
+// в центр масс её ячейки. Частица остаётся на месте, если её ячейку отсеяли или
+// центр масс вне фигуры (у вогнутых мест ячейка бывает невыпуклой).
+//
+// interior: подвижные частицы (не меняется), gn: нормированный контур, h: шаг
+// ячеек, weldTol: допуск склейки вершин, уже × h. Возвращает новый срез той же
+// длины и в том же порядке.
+func lloydStep(interior []geometry.Point, gn geometry.Geometry, h, weldTol float64) ([]geometry.Point, error) {
+	sameCoords := func(p geometry.Point) geometry.Point { return p }
+	cellMesh, err := buildCells(interior, gn, h, weldTol, sameCoords)
+	if err != nil {
+		return nil, err
+	}
+	centroidBySite := make(map[geometry.Point]geometry.Point, len(cellMesh.Cells))
+	for i := range cellMesh.Cells {
+		if centroid, ok := polyCentroid(cellMesh.Cell(i)); ok {
+			centroidBySite[cellMesh.Sites[i]] = centroid
+		}
+	}
+	moved := make([]geometry.Point, len(interior))
+	for i, particle := range interior {
+		moved[i] = particle
+		if centroid, ok := centroidBySite[particle]; ok && gn.Contains(centroid) {
+			moved[i] = centroid
+		}
+	}
+	return moved, nil
+}
+
+// polyCentroid — центр масс простого многоугольника.
+//
+// pts: вершины по кругу, в любую сторону. Возвращает центр масс; ok = false,
+// если площадь нулевая и центра нет.
+func polyCentroid(pts []geometry.Point) (centroid geometry.Point, ok bool) {
+	var doubledArea, sumX, sumY float64
+	for i := range pts {
+		a, b := pts[i], pts[(i+1)%len(pts)]
+		cross := a.X*b.Y - b.X*a.Y
+		doubledArea += cross
+		sumX += (a.X + b.X) * cross
+		sumY += (a.Y + b.Y) * cross
+	}
+	if math.Abs(doubledArea) < 1e-14 {
+		return geometry.Point{}, false
+	}
+	return geometry.Point{X: sumX / (3 * doubledArea), Y: sumY / (3 * doubledArea)}, true
+}
+
 // reflectDist — с какого расстояния от края (× h) частицу отражаем. Ячейка
 // частицы ~0.6h в радиусе, так что дальше ~h отражение её уже не касается;
 // 1.5h — с запасом, как в PolyMesher.
 const reflectDist = 1.5
 
+// sameWallCos — косинус угла, ближе которого две точки контура считаются одной
+// стенкой (60°). Участки одной дуги видны почти в одном направлении, и отдельные
+// отражения для них дали бы кучу почти совпавших точек.
+const sameWallCos = 0.5
+
 // reflectAcrossBoundary — отражения частиц у края через контур (как в
-// PolyMesher): для каждой частицы ближе maxDist к контуру — точка
-// p' = 2q − p, где q — ближайшая к ней точка контура. Серединный
+// PolyMesher): для частицы ближе maxDist к контуру — точка p' = 2q − p для
+// каждой стенки рядом, где q — точка стенки напротив частицы. Серединный
 // перпендикуляр к p–p' проходит через q по касательной к контуру, так что
 // граница между ячейкой частицы и ячейкой её отражения сама ложится на край.
-// Отражение, попавшее внутрь фигуры (у вогнутых углов и в узких местах),
-// выкидываем — иначе оно отъест кусок у настоящих ячеек. Частица ровно на
-// контуре отражения не даёт: оно совпало бы с ней самой.
+// Стенок бывает несколько: в углу и в тонкой фигуре ячейку надо закрыть с
+// разных сторон. Отражение, попавшее внутрь фигуры (у вогнутых углов и в узких
+// местах), выкидываем — иначе оно отъест кусок у настоящих ячеек. Частица ровно
+// на контуре отражений не даёт: они совпали бы с ней самой.
 //
 // particles: внутренние частицы, gn: фигура (нормированная), maxDist: порог
-// расстояния до контура. Возвращает отражения (порядок — как у particles,
-// без пропущенных); связи "отражение -> частица" не хранится, она не нужна.
+// расстояния до контура. Возвращает отражения (связь "отражение -> частица" не
+// хранится, она не нужна).
 func reflectAcrossBoundary(particles []geometry.Point, gn geometry.Geometry, maxDist float64) []geometry.Point {
 	var mirrors []geometry.Point
 	for _, p := range particles {
-		q := gn.Nearest(p)
-		if d := p.Dist(q); d >= maxDist || d < coincideEps {
+		nearest := gn.Nearest(p)
+		if d := p.Dist(nearest); d >= maxDist || d < coincideEps {
 			continue
 		}
-		mirror := geometry.Point{X: 2*q.X - p.X, Y: 2*q.Y - p.Y}
-		if gn.Contains(mirror) {
-			continue
+		for _, q := range nearbyWalls(p, nearest, gn, maxDist) {
+			mirror := geometry.Point{X: 2*q.X - p.X, Y: 2*q.Y - p.Y}
+			if !gn.Contains(mirror) {
+				mirrors = append(mirrors, mirror)
+			}
 		}
-		mirrors = append(mirrors, mirror)
 	}
 	return mirrors
+}
+
+// nearbyWalls ищет стенки контура вокруг частицы: основания перпендикуляров из p
+// на отрезки контура ближе maxDist, по одному на направление (см. sameWallCos).
+//
+// p: частица, nearest: ближайшая к ней точка контура, она всегда идёт первой
+// (у вогнутого угла это вершина, перпендикуляра на неё нет), gn: фигура,
+// maxDist: порог расстояния. Возвращает точки на контуре, от ближней к дальней.
+func nearbyWalls(p, nearest geometry.Point, gn geometry.Geometry, maxDist float64) []geometry.Point {
+	var feet []geometry.Point
+	for _, contour := range append([]geometry.Polyline{gn.Outer}, gn.Holes...) {
+		for i := range contour {
+			a, b := contour[i], contour[(i+1)%len(contour)]
+			dx, dy := b.X-a.X, b.Y-a.Y
+			lengthSquared := dx*dx + dy*dy
+			if lengthSquared == 0 {
+				continue
+			}
+			t := ((p.X-a.X)*dx + (p.Y-a.Y)*dy) / lengthSquared
+			if t <= 0 || t >= 1 {
+				continue // перпендикуляр не попадает на отрезок
+			}
+			foot := geometry.Point{X: a.X + t*dx, Y: a.Y + t*dy}
+			if p.Dist(foot) < maxDist {
+				feet = append(feet, foot)
+			}
+		}
+	}
+	sort.Slice(feet, func(i, j int) bool { return p.Dist(feet[i]) < p.Dist(feet[j]) })
+
+	walls := []geometry.Point{nearest}
+	for _, foot := range feet {
+		newWall := true
+		for _, wall := range walls {
+			ax, ay := foot.X-p.X, foot.Y-p.Y
+			bx, by := wall.X-p.X, wall.Y-p.Y
+			if (ax*bx+ay*by)/(math.Hypot(ax, ay)*math.Hypot(bx, by)) > sameWallCos {
+				newWall = false
+				break
+			}
+		}
+		if newWall {
+			walls = append(walls, foot)
+		}
+	}
+	return walls
 }
 
 // usesMirror — есть ли в треугольнике отражение (палим чисто по индексу в какой "половине" массива)
@@ -598,20 +747,35 @@ func resampleBoundary(pl geometry.Polyline, step float64) []geometry.Point {
 	return out
 }
 
-// interiorLattice сеет подвижные заряды на решётке с джиттером внутри
-// домена. Только равномерная плотность — в отличие от sph-quadtree, тут нет
-// поля размеров, по которому прореживать, расстановку делает отталкивание.
-// Джиттер здесь важнее, чем был бы для статичной сетки: идеально ровная
-// стартовая решётка во многих местах даёт точки ровно на одной окружности или
-// прямой — вырожденный вход для Делоне.
+// interiorLattice сеет подвижные заряды на шестиугольной решётке с частицей
+// ровно в центре габарита. Только равномерная плотность — в отличие от
+// sph-quadtree, тут нет поля размеров, по которому прореживать, расстановку
+// делает отталкивание. Решётка шестиугольная и с центром в фигуре, потому что
+// укладку потом ни силы, ни Ллойд не меняют: с квадратной решётки на круге из
+// 18 ячеек выходило около 25 разных укладок, часто с пятиугольником в центре,
+// а отсюда почти всегда 1-6-12. Джиттер маленький и нужен только чтобы сломать
+// идеальную симметрию решётки (в ней силы уравновешены в точности); для Делоне
+// ровная шестиугольная решётка не вырождена — на окружности каждого
+// треугольника ровно 3 точки.
+//
+// g: нормированная фигура, step: шаг решётки, rng: источник джиттера.
+// Возвращает частицы внутри фигуры.
 func interiorLattice(g geometry.Geometry, step float64, rng *rand.Rand) []geometry.Point {
 	min, max := g.BoundingBox()
+	centerX, centerY := (min.X+max.X)/2, (min.Y+max.Y)/2
+	rowStep := step * math.Sqrt(3) / 2
+	rows := int((max.Y-min.Y)/rowStep) + 2
+	cols := int((max.X-min.X)/step) + 2
 	var out []geometry.Point
-	for y := min.Y + step/2; y < max.Y; y += step {
-		for x := min.X + step/2; x < max.X; x += step {
+	for row := -rows; row <= rows; row++ {
+		oddRowShift := 0.0
+		if row%2 != 0 {
+			oddRowShift = step / 2
+		}
+		for col := -cols; col <= cols; col++ {
 			p := geometry.Point{
-				X: x + (rng.Float64()-0.5)*step*0.3,
-				Y: y + (rng.Float64()-0.5)*step*0.3,
+				X: centerX + float64(col)*step + oddRowShift + (rng.Float64()-0.5)*step*0.05,
+				Y: centerY + float64(row)*rowStep + (rng.Float64()-0.5)*step*0.05,
 			}
 			if g.Contains(p) {
 				out = append(out, p)
@@ -651,4 +815,5 @@ func (e chargeErr) Error() string { return string(e) }
 const (
 	errDegenerate  = chargeErr("charge: degenerate geometry (zero-size bounding box)")
 	errTooFewCells = chargeErr("charge: h too large for this geometry (fewer than 3 interior sites seeded)")
+	errNoCells     = chargeErr("charge: h too large for this geometry (no cell survived)")
 )

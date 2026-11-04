@@ -313,6 +313,20 @@ func TestReflectAcrossBoundary(t *testing.T) {
 		t.Errorf("far from the wall: got %v, want none", got)
 	}
 
+	// в углу — по отражению через каждую стенку
+	if got := reflectAcrossBoundary([]geometry.Point{{X: 0.9, Y: 0.85}}, square, 0.3); len(got) != 2 {
+		t.Errorf("in the corner: got %v, want 2 mirrors", got)
+	}
+	// в тонкой полосе — через обе стенки, иначе ячейка не замкнётся
+	strip := geometry.Geometry{Outer: geometry.Polyline{{X: -1, Y: -0.1}, {X: 1, Y: -0.1}, {X: 1, Y: 0.1}, {X: -1, Y: 0.1}}}
+	if got := reflectAcrossBoundary([]geometry.Point{{X: 0, Y: 0.02}}, strip, 0.3); len(got) != 2 {
+		t.Errorf("in a thin strip: got %v, want 2 mirrors", got)
+	}
+	// дуга из многих отрезков — одна стенка, одно отражение
+	if got := reflectAcrossBoundary([]geometry.Point{{X: 0.9, Y: 0}}, circle(1, 200), 0.3); len(got) != 1 {
+		t.Errorf("near an arc: got %v, want 1 mirror", got)
+	}
+
 	// узкая дырка шириной 0.1: отражение частицы через её левую стенку
 	// перелетает дырку и попадает обратно в фигуру — его надо выкинуть
 	slotted := geometry.Geometry{
@@ -321,5 +335,69 @@ func TestReflectAcrossBoundary(t *testing.T) {
 	}
 	if got := reflectAcrossBoundary([]geometry.Point{{X: -0.15, Y: 0}}, slotted, 0.3); len(got) != 0 {
 		t.Errorf("mirror across a thin hole lands inside the shape and must be dropped, got %v", got)
+	}
+}
+
+// TestCharge_EvenCellAreas: ячейки у края и внутри одного размера. Проверяем
+// именно диапазон: на zalesak среднее у края было 1.03 при разбросе 0.22..2.49,
+// так что по среднему эта проблема не видна.
+func TestCharge_EvenCellAreas(t *testing.T) {
+	for _, name := range []string{"ellipse", "zalesak"} {
+		g, err := geometry.Preset(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const h = 0.09
+		min, max := g.BoundingBox()
+		cellSize := h * math.Max(max.X-min.X, max.Y-min.Y)
+		m, _, err := Mesher{}.Generate(context.Background(), g, mesher.Params{"h": h}, mesher.NopSink{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallest, largest := math.Inf(1), 0.0
+		for i := range m.Cells {
+			area := polyArea(m.Cell(i)) / (cellSize * cellSize)
+			smallest = math.Min(smallest, area)
+			largest = math.Max(largest, area)
+		}
+		t.Logf("%s: cells=%d area/h^2 %.2f..%.2f", name, len(m.Cells), smallest, largest)
+		if smallest < 0.6 || largest > 1.5 {
+			t.Errorf("%s: cell areas %.2f..%.2f h^2, want within 0.6..1.5", name, smallest, largest)
+		}
+	}
+}
+
+func TestPolyCentroid(t *testing.T) {
+	square := []geometry.Point{{X: 1, Y: 1}, {X: 3, Y: 1}, {X: 3, Y: 5}, {X: 1, Y: 5}}
+	if c, ok := polyCentroid(square); !ok || c.Dist(geometry.Point{X: 2, Y: 3}) > 1e-12 {
+		t.Errorf("polyCentroid(square) = %v, %v, want (2, 3)", c, ok)
+	}
+	line := []geometry.Point{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 2, Y: 0}}
+	if _, ok := polyCentroid(line); ok {
+		t.Error("zero-area polygon: expected ok=false")
+	}
+}
+
+func TestLloydStep_KeepsCountAndOrder(t *testing.T) {
+	g := circle(0.5, 100)
+	interior := []geometry.Point{{X: 0.1, Y: 0}, {X: -0.2, Y: 0.1}, {X: 0, Y: -0.25}, {X: 0.25, Y: 0.2}}
+	moved, err := lloydStep(interior, g, 0.2, 0.004)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(moved) != len(interior) {
+		t.Fatalf("got %d particles, want %d", len(moved), len(interior))
+	}
+	shifted := false
+	for i := range moved {
+		if !g.Contains(moved[i]) {
+			t.Errorf("particle %d left the shape: %v", i, moved[i])
+		}
+		if moved[i].Dist(interior[i]) > 1e-9 {
+			shifted = true
+		}
+	}
+	if !shifted {
+		t.Error("no particle moved")
 	}
 }

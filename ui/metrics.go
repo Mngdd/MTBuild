@@ -7,6 +7,7 @@ import (
 
 	"gioui.org/f32"
 	"gioui.org/font"
+	"gioui.org/gesture"
 	"gioui.org/io/pointer"
 	"gioui.org/layout"
 	"gioui.org/op"
@@ -23,6 +24,7 @@ import (
 )
 
 const (
+	metricsSideInset      = unit.Dp(16) // поле тела панели слева и справа
 	defaultMetricsHeight  = unit.Dp(140)
 	detailedMetricsHeight = unit.Dp(340) // при включении подробного режима панель дорастает хотя бы до этого
 	maxMetricsFraction    = 0.75
@@ -35,11 +37,13 @@ const (
 	chartCardMinWidth   = unit.Dp(200)
 	chartHeight         = unit.Dp(56)
 	histogramHeight     = unit.Dp(80)
+	infoIconSize        = unit.Dp(14)
 	metricsGap          = unit.Dp(10)
 )
 
 var (
 	iconWarning     = mustIcon(icons.AlertWarning)
+	iconInfo        = mustIcon(icons.ActionInfo)
 	colTooltipBG    = color.NRGBA{R: 0x33, G: 0x33, B: 0x33, A: 0xf0}
 	colTooltipText  = color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}
 	colDisabledFill = color.NRGBA{R: 0xb8, G: 0xb8, B: 0xb8, A: 0xff}
@@ -60,33 +64,34 @@ type metricSample struct {
 // metricDef — одна метрика панели: как её назвать, откуда взять и как
 // показать.
 type metricDef struct {
-	label    string
-	fromMesh bool // считается по сетке; иначе — по частицам
-	noChart  bool // в подробном режиме без графика (число ячеек — не про качество)
-	value    func(s metricSample) float64
-	format   string // fmt-шаблон значения
+	label       string
+	description string // что это за метрика — подсказка у значка (i) рядом с названием
+	fromMesh    bool   // считается по сетке; иначе — по частицам
+	noChart     bool   // в подробном режиме без графика (число ячеек — не про качество)
+	value       func(s metricSample) float64
+	format      string // fmt-шаблон значения
 }
 
 var particleMetricDefs = []metricDef{
-	{label: "Сдвиг за шаг", value: func(s metricSample) float64 { return s.particle.MeanStep }, format: "%.4f h"},
-	{label: "Разброс соседей", value: func(s metricSample) float64 { return s.particle.NeighborSpread }, format: "%.3f"},
+	{label: "Сдвиг частиц за шаг", description: "Средний сдвиг подвижной частицы за итерацию, в долях её целевого размера h. Падает к нулю, когда частицы успокоились; если держится на одном уровне — они всё ещё дёргаются.", value: func(s metricSample) float64 { return s.particle.MeanStep }, format: "%.4f h"},
+	{label: "Расстояние до соседа", description: "Разброс расстояний до ближайшего соседа: std/среднее, каждое расстояние поделено на целевой размер h частицы. 0 — все стоят ровно на своём шаге, чем больше — тем неравномернее.", value: func(s metricSample) float64 { return s.particle.NeighborSpread }, format: "%.3f"},
 }
 
 var triMetricDefs = append([]metricDef{
-	{label: "Треугольники", fromMesh: true, noChart: true, value: func(s metricSample) float64 { return float64(s.tri.Triangles) }, format: "%.0f"},
-	{label: "G avg", fromMesh: true, value: func(s metricSample) float64 { return s.tri.GAvg }, format: "%.3f"},
-	{label: "G min", fromMesh: true, value: func(s metricSample) float64 { return s.tri.GMin }, format: "%.3f"},
-	{label: "θ min", fromMesh: true, value: func(s metricSample) float64 { return s.tri.ThetaMinDeg }, format: "%.1f°"},
-	{label: "θ avg", fromMesh: true, value: func(s metricSample) float64 { return s.tri.ThetaAvgDeg }, format: "%.1f°"},
-	{label: "Плохих (θ<30°)", fromMesh: true, value: func(s metricSample) float64 { return 100 * s.tri.BadFraction }, format: "%.1f%%"},
+	{label: "Треугольники", description: "Сколько треугольников в сетке.", fromMesh: true, noChart: true, value: func(s metricSample) float64 { return float64(s.tri.Triangles) }, format: "%.0f"},
+	{label: "G avg", description: "Средняя форма треугольника: G = 2√3·S / (p·a), S — площадь, p — полупериметр, a — длиннейшая сторона. 1 — равносторонний, к 0 — вырожденный.", fromMesh: true, value: func(s metricSample) float64 { return s.tri.GAvg }, format: "%.3f"},
+	{label: "G min", description: "Форма G самого плохого треугольника сетки (1 — равносторонний, к 0 — вырожденный).", fromMesh: true, value: func(s metricSample) float64 { return s.tri.GMin }, format: "%.3f"},
+	{label: "θ min", description: "Самый маленький угол во всей сетке, в градусах. У равностороннего треугольника — 60°.", fromMesh: true, value: func(s metricSample) float64 { return s.tri.ThetaMinDeg }, format: "%.1f°"},
+	{label: "θ avg", description: "Средний по треугольникам наименьший угол треугольника, в градусах. У равносторонних — 60°.", fromMesh: true, value: func(s metricSample) float64 { return s.tri.ThetaAvgDeg }, format: "%.1f°"},
+	{label: "Плохих (θ<30°)", description: "Доля треугольников, у которых наименьший угол меньше 30°.", fromMesh: true, value: func(s metricSample) float64 { return 100 * s.tri.BadFraction }, format: "%.1f%%"},
 }, particleMetricDefs...)
 
 var polyMetricDefs = append([]metricDef{
-	{label: "Ячейки", fromMesh: true, noChart: true, value: func(s metricSample) float64 { return float64(s.poly.Cells) }, format: "%.0f"},
-	{label: "Сторон avg", fromMesh: true, value: func(s metricSample) float64 { return s.poly.AvgSides }, format: "%.2f"},
-	{label: "iso avg", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoAvg }, format: "%.3f"},
-	{label: "iso min", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoMin }, format: "%.3f"},
-	{label: "Площадь CV", fromMesh: true, value: func(s metricSample) float64 { return s.poly.AreaCV }, format: "%.3f"},
+	{label: "Ячейки", description: "Сколько ячеек (многоугольников) в сетке.", fromMesh: true, noChart: true, value: func(s metricSample) float64 { return float64(s.poly.Cells) }, format: "%.0f"},
+	{label: "Сторон avg", description: "Среднее число сторон у ячейки. У равномерной упаковки — около 6, как у сот.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.AvgSides }, format: "%.2f"},
+	{label: "iso avg", description: "Средняя «круглость» ячейки: 4π·S / P², S — площадь, P — периметр. 1 — круг, шестиугольник ≈ 0.91, квадрат ≈ 0.79, треугольник ≈ 0.60.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoAvg }, format: "%.3f"},
+	{label: "iso min", description: "«Круглость» 4π·S / P² самой вытянутой ячейки (1 — круг, правильный шестиугольник ≈ 0.91).", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoMin }, format: "%.3f"},
+	{label: "Разброс площади", description: "Насколько различаются площади ячеек: std/среднее. 0 — все одной площади.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.AreaCV }, format: "%.3f"},
 }, particleMetricDefs...)
 
 // metricsView — то, что панель показывает в этом кадре; собирается из
@@ -166,11 +171,15 @@ type metricsPanel struct {
 	detailedClick widget.Clickable
 	liveClick     widget.Clickable
 	list          hoverScrollList
-	headerHeight  int // высота шапки на прошлом кадре, px — из неё минимум панели
+	headerHeight  int                       // высота шапки на прошлом кадре, px — из неё минимум панели
+	infoHovers    map[string]*gesture.Hover // наведение на значок (i) у названия, по названию
 }
 
 func newMetricsPanel() *metricsPanel {
-	p := &metricsPanel{dock: dockPanel{edge: dockBottom, size: defaultMetricsHeight, maxFraction: maxMetricsFraction}}
+	p := &metricsPanel{
+		dock:       dockPanel{edge: dockBottom, size: defaultMetricsHeight, maxFraction: maxMetricsFraction},
+		infoHovers: make(map[string]*gesture.Hover),
+	}
 	p.list.Axis = layout.Vertical
 	return p
 }
@@ -202,7 +211,7 @@ func (p *metricsPanel) Layout(gtx layout.Context, th *material.Theme, view metri
 			}),
 			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 				return p.list.Layout(gtx, th, 1, func(gtx layout.Context, _ int) layout.Dimensions {
-					return layout.Inset{Left: unit.Dp(16), Right: unit.Dp(16), Bottom: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+					return layout.Inset{Left: metricsSideInset, Right: metricsSideInset, Bottom: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 						return p.body(gtx, th, view)
 					})
 				})
@@ -237,7 +246,7 @@ func (p *metricsPanel) header(gtx layout.Context, th *material.Theme, view metri
 				}
 				dims := toggleButton(gtx, th, &p.liveClick, "Живые метрики сетки", iconWarning, p.liveMesh)
 				if p.liveClick.Hovered() && gtx.Enabled() {
-					tooltipBelow(gtx, th, dims.Size, "Строит сетку каждые 10 итераций — расчёт медленнее")
+					tooltipBelow(gtx, th, dims.Size, noTooltipLimit, "Строит сетку каждые 10 итераций — расчёт медленнее")
 				}
 				return dims
 			},
@@ -254,7 +263,7 @@ func (p *metricsPanel) body(gtx layout.Context, th *material.Theme, view metrics
 		return lbl.Layout(gtx)
 	}
 	if !p.detailed {
-		return compactGrid(gtx, th, view)
+		return p.compactGrid(gtx, th, view)
 	}
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -262,11 +271,11 @@ func (p *metricsPanel) body(gtx layout.Context, th *material.Theme, view metrics
 				return layout.Dimensions{}
 			}
 			return layout.Inset{Bottom: metricsGap}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return sidesHistogramCard(gtx, th, view)
+				return p.sidesHistogramCard(gtx, th, view)
 			})
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return chartGrid(gtx, th, view)
+			return p.chartGrid(gtx, th, view)
 		}),
 	)
 }
@@ -278,9 +287,11 @@ func gridColumns(width, minWidth, gap int) int {
 }
 
 // layoutGrid раскладывает count ячеек равной ширины по колонкам на всю
-// ширину gtx, ряд за рядом. gap — промежуток между ячейками; cell(gtx, i)
-// рисует i-ю ячейку в точную ширину и свою высоту. Возвращает размер сетки.
-func layoutGrid(gtx layout.Context, count int, minWidth, gap unit.Dp, cell func(gtx layout.Context, i int) layout.Dimensions) layout.Dimensions {
+// ширину gtx, ряд за рядом. gap — промежуток между ячейками; cell(gtx, i,
+// roomRight) рисует i-ю ячейку в точную ширину и свою высоту, roomRight —
+// сколько пикселей сетки ещё правее этой ячейки (подсказкам — чтобы не
+// вылезать за край). Возвращает размер сетки.
+func layoutGrid(gtx layout.Context, count int, minWidth, gap unit.Dp, cell func(gtx layout.Context, i, roomRight int) layout.Dimensions) layout.Dimensions {
 	width, gapPx := gtx.Constraints.Max.X, gtx.Dp(gap)
 	columns := gridColumns(width, gtx.Dp(minWidth), gapPx)
 	cellWidth := (width - gapPx*(columns-1)) / columns
@@ -291,7 +302,8 @@ func layoutGrid(gtx layout.Context, count int, minWidth, gap unit.Dp, cell func(
 			cellGtx := gtx
 			cellGtx.Constraints = layout.Constraints{Min: image.Pt(cellWidth, 0), Max: image.Pt(cellWidth, gtx.Constraints.Max.Y)}
 			offset := op.Offset(image.Pt(column*(cellWidth+gapPx), y)).Push(gtx.Ops)
-			dims := cell(cellGtx, rowStart+column)
+			cellLeft := column * (cellWidth + gapPx)
+			dims := cell(cellGtx, rowStart+column, width-cellLeft-cellWidth)
 			offset.Pop()
 			rowHeight = max(rowHeight, dims.Size.Y)
 		}
@@ -305,10 +317,10 @@ func layoutGrid(gtx layout.Context, count int, minWidth, gap unit.Dp, cell func(
 
 // compactGrid — короткий режим: блоки одинаковой ширины "название ... число",
 // между колонками тонкие разделители. Возвращает размер.
-func compactGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
+func (p *metricsPanel) compactGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
 	defs := view.defs()
 	columns := gridColumns(gtx.Constraints.Max.X, gtx.Dp(compactCellMinWidth), 0)
-	return layoutGrid(gtx, len(defs), compactCellMinWidth, 0, func(gtx layout.Context, i int) layout.Dimensions {
+	return layoutGrid(gtx, len(defs), compactCellMinWidth, 0, func(gtx layout.Context, i, roomRight int) layout.Dimensions {
 		size := image.Pt(gtx.Constraints.Min.X, gtx.Dp(compactCellHeight))
 		if i%columns != 0 { // разделитель — между колонками, не у левого края
 			paint.FillShape(gtx.Ops, colBorder, clip.Rect{Max: image.Pt(gtx.Dp(unit.Dp(1)), size.Y)}.Op())
@@ -317,7 +329,9 @@ func compactGrid(gtx layout.Context, th *material.Theme, view metricsView) layou
 		return layout.Inset{Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 			return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 				layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-					return metricLabel(gtx, th, defs[i].label)
+					// правее названия — остаток ячейки за полем 12dp, соседние ячейки и поле тела
+					maxRight := size.X - gtx.Dp(unit.Dp(12)) + roomRight + gtx.Dp(metricsSideInset)
+					return p.metricTitle(gtx, th, defs[i].label, defs[i].description, maxRight)
 				}),
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return metricValue(gtx, th, view, defs[i])
@@ -329,14 +343,16 @@ func compactGrid(gtx layout.Context, th *material.Theme, view metricsView) layou
 
 // chartGrid — подробный режим: карточки равной ширины, в каждой название,
 // текущее значение и ломаная по итерациям. Возвращает размер.
-func chartGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
+func (p *metricsPanel) chartGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
 	var defs []metricDef
 	for _, d := range view.defs() {
 		if !d.noChart {
 			defs = append(defs, d)
 		}
 	}
-	return layoutGrid(gtx, len(defs), chartCardMinWidth, metricsGap, func(gtx layout.Context, i int) layout.Dimensions {
+	return layoutGrid(gtx, len(defs), chartCardMinWidth, metricsGap, func(gtx layout.Context, i, roomRight int) layout.Dimensions {
+		// правее названия — остаток карточки за полем 10dp, соседние карточки и поле тела
+		maxRight := gtx.Constraints.Max.X - gtx.Dp(unit.Dp(10)) + roomRight + gtx.Dp(metricsSideInset)
 		d := defs[i]
 		return card(gtx, func(gtx layout.Context) layout.Dimensions {
 			points := view.metricSeries(d)
@@ -352,7 +368,7 @@ func chartGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.
 				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 					return layout.Flex{Alignment: layout.Baseline}.Layout(gtx,
 						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-							return metricLabel(gtx, th, d.label)
+							return p.metricTitle(gtx, th, d.label, d.description, maxRight)
 						}),
 						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 							return metricValue(gtx, th, view, d)
@@ -374,7 +390,7 @@ func chartGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.
 // sidesHistogramCard — гистограмма числа сторон у ячеек (только для
 // многоугольной сетки): итог, а пока считается — последний живой кадр.
 // Возвращает размер карточки.
-func sidesHistogramCard(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
+func (p *metricsPanel) sidesHistogramCard(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
 	var source *mesh.PolyQualityMetrics
 	if view.final != nil {
 		source = &view.final.poly
@@ -396,7 +412,7 @@ func sidesHistogramCard(gtx layout.Context, th *material.Theme, view metricsView
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 				return layout.Flex{Alignment: layout.Baseline}.Layout(gtx,
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
-						return metricLabel(gtx, th, "Стороны ячеек")
+						return p.metricTitle(gtx, th, "Стороны ячеек", "Сколько ячеек с 3, 4, … 9 и 10+ сторонами. У равномерной упаковки больше всего шестиугольников.", noTooltipLimit)
 					}),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 						lbl := material.Label(th, unit.Sp(11), summary)
@@ -512,6 +528,49 @@ func axisCaption(gtx layout.Context, th *material.Theme, left, middle, right str
 	)
 }
 
+// metricTitle — название метрики и за ним серый значок (i): наведёшь мышь —
+// под ним всплывает description. Название обрезается с «…», а значок
+// остаётся виден. maxRight — правее этого x (от левого края названия)
+// подсказка не вылезает. Занимает хотя бы Min.X (чтобы значение рядом
+// уехало вправо, как и раньше без значка); возвращает размер с базовой
+// линией названия — для выравнивания по ней со значением.
+func (p *metricsPanel) metricTitle(gtx layout.Context, th *material.Theme, label, description string, maxRight int) layout.Dimensions {
+	iconSide, gap := gtx.Dp(infoIconSize), gtx.Dp(unit.Dp(4))
+	labelGtx := gtx
+	labelGtx.Constraints.Min = image.Point{}
+	labelGtx.Constraints.Max.X = max(gtx.Constraints.Max.X-iconSide-gap, 0)
+	macro := op.Record(gtx.Ops)
+	labelDims := metricLabel(labelGtx, th, label)
+	labelCall := macro.Stop()
+
+	height := max(labelDims.Size.Y, iconSide)
+	labelTop := (height - labelDims.Size.Y) / 2
+	offset := op.Offset(image.Pt(0, labelTop)).Push(gtx.Ops)
+	labelCall.Add(gtx.Ops)
+	offset.Pop()
+
+	hover := p.infoHovers[label]
+	if hover == nil {
+		hover = new(gesture.Hover)
+		p.infoHovers[label] = hover
+	}
+	iconAt := image.Pt(labelDims.Size.X+gap, (height-iconSide)/2)
+	offset = op.Offset(iconAt).Push(gtx.Ops)
+	iconGtx := gtx
+	iconGtx.Constraints = layout.Exact(image.Pt(iconSide, iconSide))
+	iconInfo.Layout(iconGtx, colDisabledFill)
+	area := clip.Rect{Max: image.Pt(iconSide, iconSide)}.Push(gtx.Ops)
+	hover.Add(gtx.Ops)
+	area.Pop()
+	if hover.Update(gtx.Source) {
+		tooltipBelow(gtx, th, image.Pt(iconSide, iconSide), maxRight-iconAt.X, description)
+	}
+	offset.Pop()
+
+	width := max(iconAt.X+iconSide, gtx.Constraints.Min.X)
+	return layout.Dimensions{Size: image.Pt(width, height), Baseline: height - labelTop - labelDims.Size.Y + labelDims.Baseline}
+}
+
 // metricLabel — название метрики в одну строку. Возвращает размер.
 func metricLabel(gtx layout.Context, th *material.Theme, text string) layout.Dimensions {
 	lbl := material.Label(th, unit.Sp(12), text)
@@ -603,12 +662,15 @@ func toggleButton(gtx layout.Context, th *material.Theme, click *widget.Clickabl
 	})
 }
 
+// noTooltipLimit — у tooltipBelow нет ограничения справа.
+const noTooltipLimit = 1 << 30
+
 // tooltipBelow рисует подсказку text под элементом размера anchor (в его
 // координатах) поверх всего остального — через op.Defer, иначе её закрыло бы
-// то, что раскладывается позже.
-func tooltipBelow(gtx layout.Context, th *material.Theme, anchor image.Point, text string) {
-	macro := op.Record(gtx.Ops)
-	op.Offset(image.Pt(0, anchor.Y+gtx.Dp(unit.Dp(4)))).Add(gtx.Ops)
+// то, что раскладывается позже. maxRight — правее этого x (от левого края
+// элемента) подсказка не вылезает: если не влезает, сдвигается влево (иначе
+// у правой колонки её обрезал бы край окна).
+func tooltipBelow(gtx layout.Context, th *material.Theme, anchor image.Point, maxRight int, text string) {
 	tipGtx := gtx
 	tipGtx.Constraints = layout.Constraints{Max: image.Pt(gtx.Dp(unit.Dp(260)), gtx.Dp(unit.Dp(200)))}
 	inner := op.Record(gtx.Ops)
@@ -618,6 +680,10 @@ func tooltipBelow(gtx layout.Context, th *material.Theme, anchor image.Point, te
 		return lbl.Layout(gtx)
 	})
 	innerCall := inner.Stop()
+
+	macro := op.Record(gtx.Ops)
+	left := min(0, maxRight-dims.Size.X)
+	op.Offset(image.Pt(left, anchor.Y+gtx.Dp(unit.Dp(4)))).Add(gtx.Ops)
 	paint.FillShape(gtx.Ops, colTooltipBG, clip.UniformRRect(image.Rectangle{Max: dims.Size}, gtx.Dp(unit.Dp(4))).Op(gtx.Ops))
 	innerCall.Add(gtx.Ops)
 	op.Defer(gtx.Ops, macro.Stop())
