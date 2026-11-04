@@ -102,6 +102,7 @@ type metricsView struct {
 	totalIters int            // итераций у запуска; 0 — неитерационный алгоритм или ещё не знаем
 	samples    []metricSample // история по кадрам
 	final      *metricSample  // итог по готовой сетке; nil — расчёт идёт, упал или ещё не запускали
+	seed       int64          // случайный сид запуска; 0 — сид задан параметром или его нет
 }
 
 // series — точки графика одной метрики: x — итерация, y — значение.
@@ -250,6 +251,14 @@ func (p *metricsPanel) header(gtx layout.Context, th *material.Theme, view metri
 				}
 				return dims
 			},
+			func(gtx layout.Context) layout.Dimensions {
+				if view.seed == 0 {
+					return layout.Dimensions{}
+				}
+				lbl := material.Label(th, unit.Sp(12), fmt.Sprintf("Случайный сид: %d", view.seed))
+				lbl.Color = colTextSecond
+				return lbl.Layout(gtx)
+			},
 		)
 	})
 }
@@ -281,9 +290,11 @@ func (p *metricsPanel) body(gtx layout.Context, th *material.Theme, view metrics
 }
 
 // gridColumns — сколько колонок шириной не меньше minWidth (с промежутком
-// gap между ними) влезает в width; минимум одна.
-func gridColumns(width, minWidth, gap int) int {
-	return max(1, (width+gap)/(minWidth+gap))
+// gap между ними) влезает в width, но не больше count ячеек: иначе на
+// широком окне справа оставались бы пустые колонки, а ячейки не
+// растягивались. Минимум одна.
+func gridColumns(width, minWidth, gap, count int) int {
+	return max(1, min((width+gap)/(minWidth+gap), count))
 }
 
 // layoutGrid раскладывает count ячеек равной ширины по колонкам на всю
@@ -293,7 +304,7 @@ func gridColumns(width, minWidth, gap int) int {
 // вылезать за край). Возвращает размер сетки.
 func layoutGrid(gtx layout.Context, count int, minWidth, gap unit.Dp, cell func(gtx layout.Context, i, roomRight int) layout.Dimensions) layout.Dimensions {
 	width, gapPx := gtx.Constraints.Max.X, gtx.Dp(gap)
-	columns := gridColumns(width, gtx.Dp(minWidth), gapPx)
+	columns := gridColumns(width, gtx.Dp(minWidth), gapPx, count)
 	cellWidth := (width - gapPx*(columns-1)) / columns
 	y := 0
 	for rowStart := 0; rowStart < count; rowStart += columns {
@@ -319,7 +330,7 @@ func layoutGrid(gtx layout.Context, count int, minWidth, gap unit.Dp, cell func(
 // между колонками тонкие разделители. Возвращает размер.
 func (p *metricsPanel) compactGrid(gtx layout.Context, th *material.Theme, view metricsView) layout.Dimensions {
 	defs := view.defs()
-	columns := gridColumns(gtx.Constraints.Max.X, gtx.Dp(compactCellMinWidth), 0)
+	columns := gridColumns(gtx.Constraints.Max.X, gtx.Dp(compactCellMinWidth), 0, len(defs))
 	return layoutGrid(gtx, len(defs), compactCellMinWidth, 0, func(gtx layout.Context, i, roomRight int) layout.Dimensions {
 		size := image.Pt(gtx.Constraints.Min.X, gtx.Dp(compactCellHeight))
 		if i%columns != 0 { // разделитель — между колонками, не у левого края

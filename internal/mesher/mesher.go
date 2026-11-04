@@ -80,6 +80,10 @@ type Frame struct {
 	// не строит, а даёт вызвать тому, кому она нужна. Звать только внутри
 	// Sink.Snapshot: после возврата из него частицы уже едут дальше.
 	BuildMesh func() (mesh.Mesh, error)
+	// Seed — сид генератора случайных чисел, если алгоритм выбрал его сам,
+	// случайно; 0 — сид задан параметром или случайности нет. Нужен, чтобы
+	// удачный случайный запуск можно было повторить.
+	Seed int64
 }
 
 // Sink receives progress reports and snapshots. Implementations must be safe to

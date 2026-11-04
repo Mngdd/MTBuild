@@ -90,6 +90,7 @@ type progressSink struct {
 	iter         atomic.Int64 // 1..totalIters, 0 — итераций ещё не было
 	totalIters   atomic.Int64
 	lastWakeNano atomic.Int64 // когда последний раз звали Invalidate (UnixNano)
+	seed         atomic.Int64 // случайный сид запуска из кадра (Frame.Seed); 0 — не случайный
 
 	historyMutex sync.Mutex
 	history      []metricSample // по кадру на каждые 10 итераций
@@ -102,6 +103,9 @@ func (s *progressSink) Progress(string, float64) {}
 // прямо тут, в горутине расчёта, пока частицы стоят (этим живые метрики и
 // замедляют расчёт). Кадры неитерационных стадий (TotalIters == 0) пропускает.
 func (s *progressSink) Snapshot(f mesher.Frame) {
+	if f.Seed != 0 { // сид приходит в кадре init, а он неитерационный — ловим до проверки ниже
+		s.seed.Store(f.Seed)
+	}
 	if f.TotalIters <= 0 {
 		return
 	}
@@ -265,6 +269,7 @@ func (r *runState) metricsView() metricsView {
 	view := metricsView{running: r.running, polygonal: r.polygonal, samples: r.samples}
 	if r.progress != nil {
 		view.totalIters = int(r.progress.totalIters.Load())
+		view.seed = r.progress.seed.Load()
 	}
 	if r.hasFinal {
 		view.final = &metricSample{hasMesh: true, tri: r.metrics, poly: r.polyMetrics}

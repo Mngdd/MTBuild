@@ -104,6 +104,9 @@ func (stderrSink) Snapshot(fr mesher.Frame) {
 		cells = len(fr.Mesh.Triangles) + len(fr.Mesh.Cells)
 	}
 	fmt.Fprintf(os.Stderr, "  snapshot %-14s iter=%d points=%d cells=%d\n", fr.Stage, fr.Iter, len(fr.Particles), cells)
+	if fr.Seed != 0 {
+		fmt.Fprintf(os.Stderr, "  random seed %d\n", fr.Seed)
+	}
 }
 
 func printMetrics(q mesh.QualityMetrics) {

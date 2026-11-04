@@ -31,6 +31,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"time"
 
 	"MTBuild/internal/delaunay"
 	"MTBuild/internal/geometry"
@@ -48,7 +49,7 @@ func (Mesher) Name() string { return "charge-voronoi" }
 // алгоритма в UI ощущались одинаково.
 var (
 	pH       = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
-	pExp     = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 3, Step: 0.25}
+	pExp     = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 4, Step: 0.25}
 	pK       = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
 	pDamping = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
 	pClamp   = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
@@ -60,7 +61,14 @@ var (
 	// Шаг кольца граничных зарядов. Сдвигает баланс плотности край/середина:
 	// замерено на zalesak и эллипсе, 1h при n=3 ровнее старых 0.5h при n=2.
 	pBoundaryStep = mesher.ParamSpec{Key: "boundary_step", Label: "Boundary charge spacing (× h)", Min: 0.25, Max: 2, Def: 1, Step: 0.05}
-	pSeparate     = mesher.ParamSpec{Key: "separate", Label: "Push apart coincident particles", Kind: mesher.KindBool, Def: 1}
+	// Случайный посев вместо шестиугольной решётки — сравнить, насколько итог
+	// зависит от начальной укладки. Частиц столько же, сколько дала бы решётка.
+	pRandomInit = mesher.ParamSpec{Key: "random_init", Label: "Random initial placement", Kind: mesher.KindBool, Def: 0}
+	// Фиксированный сид генератора случайных чисел вместо случайного
+	pFixSeed = mesher.ParamSpec{Key: "fix_seed", Label: "Prevent random seed", Kind: mesher.KindBool, Def: 1}
+	pSeed    = mesher.ParamSpec{Key: "seed", Label: "Random seed", Min: 1, Max: 1024, Def: 1, Step: 1, DependsOn: "fix_seed"}
+	// Попытаться раскидать слипшиеся частицы - сейчас из-за сварки оно устарело и юзлес
+	pSeparate = mesher.ParamSpec{Key: "separate", Label: "Push apart coincident particles", Kind: mesher.KindBool, Def: 0}
 	// Вершины ячеек ближе этого склеиваются в одну — всегда, настраивается только
 	// расстояние. Убирает ложные рёбра ~0 длины (почти "круговые" четвёрки
 	// частиц) и этим возвращает шестиугольники; при большем допуске начинают
@@ -72,11 +80,11 @@ var (
 	// Выравнивают площади у края. 30 — с запасом: на zalesak при 10 частица,
 	// прижатая к контуру, ещё не успевает уйти (площади 0.40..0.99 h², при 30 —
 	// 0.64..0.99). 0 — выключено.
-	pLloydIters = mesher.ParamSpec{Key: "lloyd_iters", Label: "Lloyd iterations (0 = off)", Min: 0, Max: 100, Def: 30, Step: 1}
+	pLloydIters = mesher.ParamSpec{Key: "lloyd_iters", Label: "Lloyd iterations (0 = off)", Min: 0, Max: 150, Def: 30, Step: 1}
 )
 
 func (Mesher) Params() []mesher.ParamSpec {
-	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pStepDecay, pBoundaryStep, pSeparate, pWeldTol, pIters, pLloydIters}
+	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pStepDecay, pBoundaryStep, pRandomInit, pFixSeed, pSeed, pSeparate, pWeldTol, pIters, pLloydIters}
 }
 
 func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params, sink mesher.Sink) (mesh.Mesh, mesh.QualityMetrics, error) {
@@ -86,6 +94,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	clamp := p.Bool(pClamp)
 	stepDecay := p.Bool(pStepDecay)
 	boundaryStep := p.Get(pBoundaryStep) * h
+	randomInit := p.Bool(pRandomInit)
 	separate := p.Bool(pSeparate)
 	weldTol := p.Get(pWeldTol) * h
 	damping := p.Get(pDamping)
@@ -119,8 +128,23 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	for _, hole := range gn.Holes {
 		boundary = append(boundary, resampleBoundary(hole, boundaryStep)...)
 	}
-	rng := rand.New(rand.NewSource(1))
-	interior := interiorLattice(gn, h, rng) // сыпем внутрянку
+	// Случайный сид — из того же диапазона, что и pSeed, чтобы его можно было
+	// вбить обратно и повторить запуск. Отдаём наружу только его (randomSeed),
+	// заданный пользователем он и так знает.
+	var seed, randomSeed int64
+	if p.Bool(pFixSeed) {
+		seed = int64(math.Round(p.Get(pSeed))) // round, а не int(): из GUI целые приходят как 579.99997 (ползунок во float32)
+	} else {
+		randomSeed = 1 + time.Now().UnixNano()%int64(pSeed.Max)
+		seed = randomSeed
+	}
+	rng := rand.New(rand.NewSource(seed))
+	var interior []geometry.Point
+	if randomInit {
+		interior = interiorRandom(gn, h, rng) // сыпем внутрянку на рандом
+	} else {
+		interior = interiorLattice(gn, h, rng) // сыпем внутрянку
+	}
 	if len(interior) < 3 {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, errTooFewCells
 	}
@@ -128,7 +152,7 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err
 	}
 	sink.Progress("init", 1)
-	sink.Snapshot(mesher.Frame{Stage: "init", Particles: denormAll(append(append([]geometry.Point{}, interior...), boundary...), denorm)})
+	sink.Snapshot(mesher.Frame{Stage: "init", Particles: denormAll(append(append([]geometry.Point{}, interior...), boundary...), denorm), Seed: randomSeed})
 
 	// --- релаксация: попарное отталкивание + затухание ---------------------
 	vel := make([]geometry.Point, len(interior))
@@ -742,6 +766,27 @@ func resampleBoundary(pl geometry.Polyline, step float64) []geometry.Point {
 		carry = math.Mod(carry-seg, step)
 		if carry < 0 {
 			carry += step
+		}
+	}
+	return out
+}
+
+// interiorRandom сеет столько же подвижных зарядов, сколько дала бы
+// шестиугольная решётка (interiorLattice), но равномерно случайно по фигуре.
+//
+// g: нормированная фигура, step: шаг решётки (нужен только для числа частиц),
+// rng: источник случайности. Возвращает частицы внутри фигуры.
+func interiorRandom(g geometry.Geometry, step float64, rng *rand.Rand) []geometry.Point {
+	count := len(interiorLattice(g, step, rng))
+	min, max := g.BoundingBox()
+	out := make([]geometry.Point, 0, count)
+	for len(out) < count {
+		p := geometry.Point{
+			X: min.X + rng.Float64()*(max.X-min.X),
+			Y: min.Y + rng.Float64()*(max.Y-min.Y),
+		}
+		if g.Contains(p) {
+			out = append(out, p)
 		}
 	}
 	return out

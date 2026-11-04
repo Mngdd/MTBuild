@@ -21,10 +21,11 @@ import (
 // [0,1], so the spec's Min/Max live here to convert both ways. A KindBool
 // spec uses check instead and leaves float/editor unused.
 type paramCtrl struct {
-	spec   mesher.ParamSpec
-	float  widget.Float
-	editor widget.Editor
-	check  widget.Bool // used only for KindBool
+	spec          mesher.ParamSpec
+	float         widget.Float
+	editor        widget.Editor
+	editorFocused bool        // окошко было в фокусе на прошлом кадре — чтобы поймать уход из него
+	check         widget.Bool // used only for KindBool
 }
 
 func newParamCtrl(spec mesher.ParamSpec) *paramCtrl {
@@ -46,20 +47,28 @@ func (c *paramCtrl) value() float64 {
 		}
 		return 0
 	}
-	return c.spec.Min + float64(c.float.Value)*(c.spec.Max-c.spec.Min)
+	// Слайдер хранит долю во float32, и без округления 37 доезжает до
+	// алгоритма как 36.99999996 (а int() от этого — 36). Округляем до тех же
+	// знаков, что видны в окошке, — алгоритм получает ровно показанное число.
+	v := c.spec.Min + float64(c.float.Value)*(c.spec.Max-c.spec.Min)
+	scale := math.Pow(10, float64(stepDecimals(c.spec.Step)))
+	return math.Round(v*scale) / scale
 }
 
+// setValue ставит ползунок на v (зажатое в [Min, Max]) и переписывает окошко
+// этим числом.
 func (c *paramCtrl) setValue(v float64) {
-	if v < c.spec.Min {
-		v = c.spec.Min
-	}
-	if v > c.spec.Max {
-		v = c.spec.Max
-	}
+	c.setSlider(v)
+	c.editor.SetText(formatParam(c.value(), c.spec.Step))
+}
+
+// setSlider ставит только ползунок на v, зажатое в [Min, Max]; окошко не
+// трогает — так ввод подхватывается на лету, не сбивая набираемый текст.
+func (c *paramCtrl) setSlider(v float64) {
+	v = min(max(v, c.spec.Min), c.spec.Max)
 	if c.spec.Max > c.spec.Min {
 		c.float.Value = float32((v - c.spec.Min) / (c.spec.Max - c.spec.Min))
 	}
-	c.editor.SetText(formatParam(v, c.spec.Step))
 }
 
 // Layout draws the label, the number box and the slider, and reconciles
@@ -74,19 +83,31 @@ func (c *paramCtrl) Layout(gtx layout.Context, th *material.Theme) layout.Dimens
 		return cb.Layout(gtx)
 	}
 
+	// Ввод в окошко подхватывается сразу, без Enter: каждое изменение, которое
+	// уже читается как число, двигает ползунок (а значит и то, что уйдёт в
+	// алгоритм). Недописанное ("0.", "-", пусто) пропускаем — ползунок стоит
+	// на последнем числе. Сам текст при этом не трогаем, чтобы не сбивать
+	// набор; выравниваем его по ползунку (зажатое в Min..Max, нужное число
+	// знаков) на Enter и при уходе из окошка.
 	for {
 		ev, ok := c.editor.Update(gtx)
 		if !ok {
 			break
 		}
-		if _, submitted := ev.(widget.SubmitEvent); submitted {
+		switch ev.(type) {
+		case widget.ChangeEvent:
 			if v, err := strconv.ParseFloat(strings.TrimSpace(c.editor.Text()), 64); err == nil {
-				c.setValue(v)
-			} else {
-				c.setValue(c.value()) // bad input: revert the box to the last good value
+				c.setSlider(v)
 			}
+		case widget.SubmitEvent:
+			c.setValue(c.value())
 		}
 	}
+	focused := gtx.Source.Focused(&c.editor)
+	if c.editorFocused && !focused {
+		c.setValue(c.value())
+	}
+	c.editorFocused = focused
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -160,11 +181,22 @@ func numberBox(gtx layout.Context, th *material.Theme, ed *widget.Editor) layout
 // step=0.005 -> 3 decimals, step=10 -> integer), matching what the slider
 // can actually reach.
 func formatParam(v, step float64) string {
-	dec := 0
-	if step > 0 && step < 1 {
-		dec = int(math.Ceil(-math.Log10(step)))
+	return strconv.FormatFloat(v, 'f', stepDecimals(step), 64)
+}
+
+// stepDecimals — сколько знаков после запятой у шага step, по его самой
+// короткой записи: 0.25 -> 2, 0.005 -> 3, 10 -> 0. Столько знаков показывает
+// окошко и до стольких округляется значение (paramCtrl.value). Шаг 0 или
+// меньше — 0 знаков.
+func stepDecimals(step float64) int {
+	if step <= 0 {
+		return 0
 	}
-	return strconv.FormatFloat(v, 'f', dec, 64)
+	digits := strconv.FormatFloat(step, 'f', -1, 64)
+	if dot := strings.IndexByte(digits, '.'); dot >= 0 {
+		return len(digits) - dot - 1
+	}
+	return 0
 }
 
 // algoParams holds one algorithm's live parameter controls, built once from
