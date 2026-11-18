@@ -106,7 +106,8 @@ type meshView struct {
 	dragging bool
 	dragLast f32.Point // позиция курсора на прошлом событии перетаскивания
 
-	resetClick widget.Clickable
+	resetClick  widget.Clickable
+	cellMetrics cellMetricView
 
 	// Видимость слоёв точек переживает новые результаты: спрятал частицы — они
 	// остаются спрятанными и при следующем Start.
@@ -123,10 +124,11 @@ type dotLayer struct {
 
 // setMesh показывает новую сетку. m: готовая сетка; g: контур, по которому её
 // строили (его bbox задаёт "вписать целиком", сам контур рисуется поверх).
+// qualities: метрики по порядку ячеек, nil для треугольной сетки.
 // Камера сбрасывается, только если сменился контур — при перезапуске на том же
 // контуре с другими параметрами зум и сдвиг остаются, чтобы сравнивать один и
 // тот же увеличенный участок. У периодической сетки вместо g — квадрат-период.
-func (v *meshView) setMesh(m mesh.Mesh, g geometry.Geometry) {
+func (v *meshView) setMesh(m mesh.Mesh, g geometry.Geometry, qualities []mesh.CellQuality) {
 	if m.Period > 0 {
 		g = v.periodSquare(m.Period)
 	}
@@ -135,10 +137,15 @@ func (v *meshView) setMesh(m mesh.Mesh, g geometry.Geometry) {
 	}
 	v.mesh, v.geom, v.edges, v.hasMesh = m, g, uniqueEdges(m), true
 	v.centroids = nil
+	v.cellMetrics.reset(len(qualities))
 	if m.Polygonal {
 		v.centroids = make([]geometry.Point, len(m.Cells))
 		for i := range m.Cells {
-			v.centroids[i] = polygonCentroid(m.Cell(i))
+			polygon := geometry.Polyline(m.Cell(i))
+			v.centroids[i] = polygonCentroid(polygon)
+			if i < len(qualities) {
+				v.cellMetrics.setCell(i, qualities[i], polygon, v.centroids[i])
+			}
 		}
 	}
 }
@@ -238,13 +245,14 @@ func (v *meshView) resetCamera() {
 }
 
 // Layout рисует сетку на весь отведённый прямоугольник (gtx.Constraints.Max),
-// кнопку сброса вида в правом верхнем углу и легенду точек (с глазами для
+// кнопки вида в правом верхнем углу и легенду точек (с глазами для
 // скрытия) в левом верхнем. Возвращает размер всей области.
 func (v *meshView) Layout(gtx layout.Context, th *material.Theme) layout.Dimensions {
 	size := gtx.Constraints.Max
 	if v.resetClick.Clicked(gtx) {
 		v.resetCamera()
 	}
+	v.cellMetrics.update(gtx)
 	for _, layer := range []*dotLayer{&v.sitesLayer, &v.centroidsLayer} {
 		if layer.toggle.Clicked(gtx) {
 			layer.hidden = !layer.hidden
@@ -252,29 +260,21 @@ func (v *meshView) Layout(gtx layout.Context, th *material.Theme) layout.Dimensi
 	}
 	v.handleInput(gtx, size)
 
-	area := clip.Rect{Max: size}.Push(gtx.Ops)
+	defer clip.Rect{Max: size}.Push(gtx.Ops).Pop()
 	paint.Fill(gtx.Ops, colViewBG)
-	event.Op(gtx.Ops, v)
-	if v.dragging {
-		pointer.CursorGrabbing.Add(gtx.Ops)
-	} else {
-		pointer.CursorGrab.Add(gtx.Ops)
+	{
+		area := clip.Rect{Max: size}.Push(gtx.Ops)
+		event.Op(gtx.Ops, v)
+		if v.dragging {
+			pointer.CursorGrabbing.Add(gtx.Ops)
+		} else {
+			pointer.CursorGrab.Add(gtx.Ops)
+		}
+		area.Pop()
 	}
-	v.drawMesh(gtx, size)
-	area.Pop()
+	v.drawMesh(gtx, th, size)
 
-	// Кнопка рисуется после холста, поэтому клик по ней достаётся ей, а не
-	// холсту (порядок отрисовки = приоритет попадания, см. ui/README.md).
 	gtx.Constraints.Min = size
-	layout.NE.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-			btn := material.Button(th, &v.resetClick, "Сбросить вид")
-			btn.TextSize = unit.Sp(12)
-			btn.Background = colTextSecond
-			btn.Inset = layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(10), Right: unit.Dp(10)}
-			return btn.Layout(gtx)
-		})
-	})
 	// Легенда — тоже после холста, чтобы клики по её пунктам доставались ей.
 	if len(v.centroids) > 0 {
 		layout.NW.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -294,6 +294,35 @@ func (v *meshView) Layout(gtx layout.Context, th *material.Theme) layout.Dimensi
 			})
 		})
 	}
+	if v.cellMetrics.active() {
+		layout.SE.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return v.cellMetrics.scale(gtx, th)
+			})
+		})
+	}
+	if v.cellMetrics.open {
+		v.cellMetrics.backdrop.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Dimensions{Size: size}
+		})
+	}
+	layout.NE.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.UniformInset(unit.Dp(8)).Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			reset := material.Button(th, &v.resetClick, "Сбросить вид")
+			reset.TextSize, reset.Background = unit.Sp(12), colTextSecond
+			reset.Inset = layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(10), Right: unit.Dp(10)}
+			if len(v.cellMetrics.labels) == 0 {
+				return reset.Layout(gtx)
+			}
+			return layout.Flex{Axis: layout.Vertical, Alignment: layout.End}.Layout(gtx,
+				layout.Rigid(reset.Layout),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return v.cellMetrics.menu(gtx, th)
+				}),
+			)
+		})
+	})
 	return layout.Dimensions{Size: size}
 }
 
@@ -431,8 +460,8 @@ func (v *meshView) worldToScreen(size image.Point, marginPx int) func(geometry.P
 }
 
 // drawMesh рисует заливку ячеек, их рёбра и поверх — контур с дырками.
-// size: размер холста в пикселях.
-func (v *meshView) drawMesh(gtx layout.Context, size image.Point) {
+// th: тема подписей метрик; size: размер холста в пикселях.
+func (v *meshView) drawMesh(gtx layout.Context, th *material.Theme, size image.Point) {
 	toScreen := v.worldToScreen(size, gtx.Dp(fitMargin))
 	fillCol, edgeCol := colMeshFill, colMeshEdge
 	if v.mesh.Polygonal {
@@ -460,7 +489,11 @@ func (v *meshView) drawMesh(gtx layout.Context, size image.Point) {
 		}
 	}
 
-	paint.FillShape(gtx.Ops, fillCol, clip.Outline{Path: v.cellsPath(gtx.Ops, toScreen)}.Op())
+	if v.cellMetrics.active() {
+		v.drawCellMetricFills(gtx.Ops, toScreen)
+	} else {
+		paint.FillShape(gtx.Ops, fillCol, clip.Outline{Path: v.cellsPath(gtx.Ops, toScreen)}.Op())
+	}
 	paint.FillShape(gtx.Ops, edgeCol, clip.Stroke{Path: v.edgesPath(gtx.Ops, toScreen), Width: edgePx}.Op())
 	paint.FillShape(gtx.Ops, colOuterContour, clip.Stroke{Path: contourPath(gtx.Ops, v.geom.Outer, toScreen), Width: contourPx}.Op())
 	for _, hole := range v.geom.Holes {
@@ -480,6 +513,9 @@ func (v *meshView) drawMesh(gtx layout.Context, size image.Point) {
 		}
 		crosses := crossesAt(gtx.Ops, centers, float32(siteCrossHalfSize)*pxPerDp)
 		paint.FillShape(gtx.Ops, colSite, clip.Stroke{Path: crosses, Width: float32(siteCrossWidth) * pxPerDp}.Op())
+	}
+	if v.cellMetrics.active() {
+		v.drawCellMetrics(gtx, th, size, toScreen)
 	}
 }
 
@@ -532,26 +568,29 @@ func dotsPath(ops *op.Ops, points []geometry.Point, toScreen func(geometry.Point
 func (v *meshView) cellsPath(ops *op.Ops, toScreen func(geometry.Point) f32.Point) clip.PathSpec {
 	var path clip.Path
 	path.Begin(ops)
-	addCell := func(vertexIndices []int) {
-		if len(vertexIndices) < 3 {
-			return
-		}
-		path.MoveTo(toScreen(v.mesh.Vertices[vertexIndices[0]]))
-		for _, vertexIndex := range vertexIndices[1:] {
-			path.LineTo(toScreen(v.mesh.Vertices[vertexIndex]))
-		}
-		path.Close()
-	}
 	if v.mesh.Polygonal {
 		for _, cell := range v.mesh.Cells {
-			addCell(cell)
+			v.addCellPath(&path, cell, toScreen)
 		}
 	} else {
 		for _, tri := range v.mesh.Triangles {
-			addCell(tri[:])
+			v.addCellPath(&path, tri[:], toScreen)
 		}
 	}
 	return path.End()
+}
+
+// addCellPath добавляет замкнутый контур ячейки с индексами vertexIndices.
+// toScreen переводит вершины сетки в координаты холста.
+func (v *meshView) addCellPath(path *clip.Path, vertexIndices []int, toScreen func(geometry.Point) f32.Point) {
+	if len(vertexIndices) < 3 {
+		return
+	}
+	path.MoveTo(toScreen(v.mesh.Vertices[vertexIndices[0]]))
+	for _, vertexIndex := range vertexIndices[1:] {
+		path.LineTo(toScreen(v.mesh.Vertices[vertexIndex]))
+	}
+	path.Close()
 }
 
 // edgesPath — все уникальные рёбра сетки (v.edges) одним путём, каждое —

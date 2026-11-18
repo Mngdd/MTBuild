@@ -278,7 +278,7 @@ func (g *geomState) panel(gtx layout.Context, th *material.Theme) layout.Dimensi
 func (g *geomState) panelRows(th *material.Theme) []layout.FlexChild {
 	rows := []layout.FlexChild{
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return g.dropdownRow(gtx, th, &g.loadClick, "Load file…", false)
+			return dropdownRow(gtx, th, &g.loadClick, "Load file…", false)
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return divider(gtx)
@@ -294,13 +294,13 @@ func (g *geomState) panelRows(th *material.Theme) []layout.FlexChild {
 	for _, name := range geomOrder {
 		name := name
 		rows = append(rows, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return g.dropdownRow(gtx, th, g.presetClicks[name], geomLabels[name], name == g.presetName)
+			return dropdownRow(gtx, th, g.presetClicks[name], geomLabels[name], name == g.presetName)
 		}))
 	}
 	return rows
 }
 
-func (g *geomState) dropdownRow(gtx layout.Context, th *material.Theme, click *widget.Clickable, label string, selected bool) layout.Dimensions {
+func dropdownRow(gtx layout.Context, th *material.Theme, click *widget.Clickable, label string, selected bool) layout.Dimensions {
 	gtx.Constraints.Min.X = gtx.Constraints.Max.X
 	gtx.Constraints.Min.Y = gtx.Dp(menuBarHeight)
 	gtx.Constraints.Max.Y = gtx.Dp(menuBarHeight)

@@ -44,6 +44,7 @@ type generateResult struct {
 	geom        geometry.Geometry // контур, по которому строили — meshView рисует его поверх сетки
 	metrics     mesh.QualityMetrics
 	polyMetrics mesh.PolyQualityMetrics
+	cellMetrics []mesh.CellQuality
 	polygonal   bool // which of metrics/polyMetrics is meaningful — mesher.Mesher.Generate always returns a zero QualityMetrics for a polygonal mesh (see internal/mesher/charge's doc comment), so this is computed here rather than inferred from metrics being non-zero
 	err         error
 }
@@ -154,7 +155,7 @@ func (r *runState) poll() {
 		r.cancel = nil
 		r.err = res.err
 		if res.err == nil {
-			r.view.setMesh(res.mesh, res.geom)
+			r.view.setMesh(res.mesh, res.geom, res.cellMetrics)
 			r.metrics = res.metrics
 			r.polyMetrics = res.polyMetrics
 			r.polygonal = res.polygonal
@@ -209,10 +210,14 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 		// QualityMetrics — that type is triangle-only — so its real numbers
 		// come from mesh.EvaluatePoly instead.
 		var polyMetrics mesh.PolyQualityMetrics
+		var cellMetrics []mesh.CellQuality
 		if m.Polygonal {
-			polyMetrics = mesh.EvaluatePoly(m, geom)
+			polyMetrics, cellMetrics = mesh.EvaluatePolyWithCells(m, geom)
 		}
-		r.resultCh <- generateResult{mesh: m, geom: geom, metrics: metrics, polyMetrics: polyMetrics, polygonal: m.Polygonal}
+		r.resultCh <- generateResult{
+			mesh: m, geom: geom, metrics: metrics, polyMetrics: polyMetrics,
+			cellMetrics: cellMetrics, polygonal: m.Polygonal,
+		}
 		r.win.Invalidate()
 	}()
 }

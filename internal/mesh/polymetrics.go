@@ -52,12 +52,20 @@ type PolyQualityMetrics struct {
 // m: сетка; g: контур, по которому её строили (для периметра по границе и
 // площади области, см. CellQualities), можно пустой.
 func EvaluatePoly(m Mesh, g geometry.Geometry) PolyQualityMetrics {
+	q, _ := EvaluatePolyWithCells(m, g)
+	return q
+}
+
+// EvaluatePolyWithCells возвращает сводку и метрики отдельных ячеек.
+// m и g — сетка и её контур, как в EvaluatePoly. Порядок метрик как в m.Cells.
+func EvaluatePolyWithCells(m Mesh, g geometry.Geometry) (PolyQualityMetrics, []CellQuality) {
 	var q PolyQualityMetrics
 	q.Cells = len(m.Cells)
 	if q.Cells == 0 {
-		return q
+		return q, nil
 	}
-	q.PerimeterMean, q.PerimeterRMS, q.SkewnessAvg, q.SkewnessMax = summarizeCellQualities(CellQualities(m, g))
+	cells := CellQualities(m, g)
+	q.PerimeterMean, q.PerimeterRMS, q.SkewnessAvg, q.SkewnessMax = summarizeCellQualities(cells)
 
 	q.MinSides = math.MaxInt32
 	q.IsoMin = math.Inf(1)
@@ -106,7 +114,7 @@ func EvaluatePoly(m Mesh, g geometry.Geometry) PolyQualityMetrics {
 	if valid == 0 {
 		q.MinSides = 0
 		q.IsoMin = 0
-		return q
+		return q, cells
 	}
 
 	n := float64(valid)
@@ -123,7 +131,7 @@ func EvaluatePoly(m Mesh, g geometry.Geometry) PolyQualityMetrics {
 	if q.AreaMean > 0 {
 		q.AreaCV = std / q.AreaMean
 	}
-	return q
+	return q, cells
 }
 
 // summarizeCellQualities сводит метрики ячеек в средние по сетке. cells:
