@@ -59,7 +59,7 @@ func main() {
 		fail(err)
 	}
 	if m.Polygonal {
-		printPolyMetrics(mesh.EvaluatePoly(m))
+		printPolyMetrics(mesh.EvaluatePoly(m, g))
 	} else {
 		printMetrics(metrics)
 	}
@@ -122,6 +122,8 @@ func printMetrics(q mesh.QualityMetrics) {
 func printPolyMetrics(q mesh.PolyQualityMetrics) {
 	fmt.Printf("cells=%d  avg_sides=%.2f  iso_avg=%.3f  iso_min=%.3f  area_cv=%.3f\n",
 		q.Cells, q.AvgSides, q.IsoAvg, q.IsoMin, q.AreaCV)
+	fmt.Printf("ph=%.4f  p2h=%.4f  skew_avg=%.4f  skew_max=%.3f\n",
+		q.PerimeterMean, q.PerimeterRMS, q.SkewnessAvg, q.SkewnessMax)
 	fmt.Print("sides histogram: ")
 	last := len(q.SidesHistogram) - 1
 	for i, c := range q.SidesHistogram {

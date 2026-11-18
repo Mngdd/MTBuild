@@ -36,7 +36,7 @@ func TestCharge_Circle(t *testing.T) {
 	if !m.Polygonal {
 		t.Fatal("expected a polygonal mesh (Cells set)")
 	}
-	q := mesh.EvaluatePoly(m)
+	q := mesh.EvaluatePoly(m, g)
 	t.Logf("cells=%d avgSides=%.2f isoAvg=%.3f isoMin=%.3f areaCV=%.3f sidesHist=%v",
 		q.Cells, q.AvgSides, q.IsoAvg, q.IsoMin, q.AreaCV, q.SidesHistogram)
 
@@ -381,7 +381,7 @@ func TestPolyCentroid(t *testing.T) {
 func TestLloydStep_KeepsCountAndOrder(t *testing.T) {
 	g := circle(0.5, 100)
 	interior := []geometry.Point{{X: 0.1, Y: 0}, {X: -0.2, Y: 0.1}, {X: 0, Y: -0.25}, {X: 0.25, Y: 0.2}}
-	moved, err := lloydStep(interior, g, 0.2, 0.004)
+	moved, err := lloydStep(interior, g, 0.2, 0.004, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,5 +399,75 @@ func TestLloydStep_KeepsCountAndOrder(t *testing.T) {
 	}
 	if !shifted {
 		t.Error("no particle moved")
+	}
+}
+
+// Периодическая сетка: квадрат-период замощён ячейками без дыр и наложений
+// (сумма площадей = 1), и каждое ребро общее ровно у двух ячеек, считая
+// ячейки через шов (вершины сравниваем по модулю периода). Не сойдись шов —
+// у рёбер на краю квадрата не нашлось бы пары. Последний случай — с большим
+// допуском сварки и недоосевшими частицами: там у шва много сваренных вершин,
+// и простая сварка (weldVertices) давала тут рёбра без пары.
+func TestCharge_PeriodicTilesWithoutSeams(t *testing.T) {
+	cases := []mesher.Params{
+		{"periodic": 1, "h": 0.1},
+		{"periodic": 1, "h": 0.1, "random_init": 1},
+		{"periodic": 1, "h": 0.05, "random_init": 1, "seed": 3, "weld_tol": 0.1, "iters": 100, "lloyd_iters": 0},
+	}
+	for caseIndex, params := range cases {
+		m, _, err := Mesher{}.Generate(context.Background(), circle(1, 200), params, mesher.NopSink{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.Period != 1 {
+			t.Fatalf("case %v: Period = %v, want 1", caseIndex, m.Period)
+		}
+		var areaSum float64
+		for i := range m.Cells {
+			areaSum += polyArea(m.Cell(i))
+		}
+		if math.Abs(areaSum-1) > 1e-9 {
+			t.Errorf("case %v: cell areas sum to %v, want 1 (gaps or overlaps)", caseIndex, areaSum)
+		}
+		for i, site := range m.Sites {
+			if site.X < 0 || site.X >= 1 || site.Y < 0 || site.Y >= 1 {
+				t.Errorf("case %v: site %d = %v outside the period square", caseIndex, i, site)
+			}
+		}
+
+		type vertexKey struct{ x, y int64 }
+		keyOf := func(p geometry.Point) vertexKey {
+			const grid = 1e7
+			x, y := p.X-math.Floor(p.X), p.Y-math.Floor(p.Y)
+			return vertexKey{int64(math.Round(x*grid)) % grid, int64(math.Round(y*grid)) % grid}
+		}
+		edgeCount := map[[2]vertexKey]int{}
+		for i := range m.Cells {
+			cell := m.Cell(i)
+			for k := range cell {
+				a, b := keyOf(cell[k]), keyOf(cell[(k+1)%len(cell)])
+				if b.x < a.x || (b.x == a.x && b.y < a.y) {
+					a, b = b, a
+				}
+				edgeCount[[2]vertexKey{a, b}]++
+			}
+		}
+		for edge, count := range edgeCount {
+			if count != 2 {
+				t.Errorf("case %v: edge %v shared by %d cells, want 2", caseIndex, edge, count)
+			}
+		}
+	}
+}
+
+func TestPeriodicHelpers(t *testing.T) {
+	if p := wrapIntoSquare(geometry.Point{X: 0.7, Y: -0.6}); p.Dist(geometry.Point{X: -0.3, Y: 0.4}) > 1e-12 {
+		t.Errorf("wrapIntoSquare = %v, want (-0.3, 0.4)", p)
+	}
+	if p := nearestImage(geometry.Point{X: 0.45, Y: 0}, geometry.Point{X: -0.45, Y: 0}); p.Dist(geometry.Point{X: -0.55, Y: 0}) > 1e-12 {
+		t.Errorf("nearestImage = %v, want (-0.55, 0) — through the edge", p)
+	}
+	if n := len(periodicImages([]geometry.Point{{X: 0, Y: 0}, {X: 0.1, Y: 0.2}})); n != 16 {
+		t.Errorf("periodicImages: %d copies, want 16", n)
 	}
 }

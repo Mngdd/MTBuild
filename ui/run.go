@@ -86,8 +86,9 @@ const titleRefresh = 100 * time.Millisecond
 // событий (runState.poll).
 type progressSink struct {
 	win          *app.Window
-	liveMesh     bool         // строить ли сетку в каждом кадре ради её метрик; задан до старта, дальше только читается
-	iter         atomic.Int64 // 1..totalIters, 0 — итераций ещё не было
+	liveMesh     bool              // строить ли сетку в каждом кадре ради её метрик; задан до старта, дальше только читается
+	geom         geometry.Geometry // контур запуска — для метрик сетки (периметр по границе); задан до старта, дальше только читается
+	iter         atomic.Int64      // 1..totalIters, 0 — итераций ещё не было
 	totalIters   atomic.Int64
 	lastWakeNano atomic.Int64 // когда последний раз звали Invalidate (UnixNano)
 	seed         atomic.Int64 // случайный сид запуска из кадра (Frame.Seed); 0 — не случайный
@@ -114,7 +115,7 @@ func (s *progressSink) Snapshot(f mesher.Frame) {
 		if m, err := f.BuildMesh(); err == nil { // не вышло — у этого кадра просто не будет метрик сетки
 			sample.hasMesh = true
 			if m.Polygonal {
-				sample.poly = mesh.EvaluatePoly(m)
+				sample.poly = mesh.EvaluatePoly(m, s.geom)
 			} else {
 				sample.tri = mesh.Evaluate(m)
 			}
@@ -188,7 +189,7 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 	r.polygonal = algoMetas[algoName].Output == "polygonal"
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	progress := &progressSink{win: r.win, liveMesh: r.panel.liveMesh}
+	progress := &progressSink{win: r.win, liveMesh: r.panel.liveMesh, geom: geom}
 	r.progress = progress
 
 	go func() {
@@ -209,7 +210,7 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 		// come from mesh.EvaluatePoly instead.
 		var polyMetrics mesh.PolyQualityMetrics
 		if m.Polygonal {
-			polyMetrics = mesh.EvaluatePoly(m)
+			polyMetrics = mesh.EvaluatePoly(m, geom)
 		}
 		r.resultCh <- generateResult{mesh: m, geom: geom, metrics: metrics, polyMetrics: polyMetrics, polygonal: m.Polygonal}
 		r.win.Invalidate()

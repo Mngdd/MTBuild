@@ -31,18 +31,33 @@ type PolyQualityMetrics struct {
 	// тем равномернее сетка по размеру ячеек.
 	AreaMean float64
 	AreaCV   float64
+
+	// PerimeterMean (ph) и PerimeterRMS (p2h) — среднее и среднеквадратичное
+	// CellQuality.PerimeterRatio. У сетки из одинаковых правильных
+	// шестиугольников оба 1; при том же среднем p2h больше у сетки с бо́льшим
+	// разбросом периметров.
+	PerimeterMean float64
+	PerimeterRMS  float64
+	// SkewnessAvg / SkewnessMax — среднее и худшее CellQuality.Skewness (0 —
+	// все углы ячеек равны). Ячейки без S (NaN) не учитываются.
+	SkewnessAvg float64
+	SkewnessMax float64
 }
 
 // EvaluatePoly считает PolyQualityMetrics по всей многоугольной сетке.
 // Вырожденные ячейки (< 3 вершин, нулевая площадь) пропускаются везде, кроме
 // Cells (считаются, но не портят остальные средние — их эффективно 0 таких
 // на нормальной сетке).
-func EvaluatePoly(m Mesh) PolyQualityMetrics {
+//
+// m: сетка; g: контур, по которому её строили (для периметра по границе и
+// площади области, см. CellQualities), можно пустой.
+func EvaluatePoly(m Mesh, g geometry.Geometry) PolyQualityMetrics {
 	var q PolyQualityMetrics
 	q.Cells = len(m.Cells)
 	if q.Cells == 0 {
 		return q
 	}
+	q.PerimeterMean, q.PerimeterRMS, q.SkewnessAvg, q.SkewnessMax = summarizeCellQualities(CellQualities(m, g))
 
 	q.MinSides = math.MaxInt32
 	q.IsoMin = math.Inf(1)
@@ -109,6 +124,35 @@ func EvaluatePoly(m Mesh) PolyQualityMetrics {
 		q.AreaCV = std / q.AreaMean
 	}
 	return q
+}
+
+// summarizeCellQualities сводит метрики ячеек в средние по сетке. cells:
+// результат CellQualities. Возвращает ph, p2h, среднее и худшее S; нули, если
+// нет ни одной годной ячейки.
+func summarizeCellQualities(cells []CellQuality) (perimeterMean, perimeterRMS, skewnessAvg, skewnessMax float64) {
+	var ratioSum, ratioSquareSum, skewnessSum float64
+	validCount, skewnessCount := 0, 0
+	for _, cell := range cells {
+		if !cell.Valid {
+			continue
+		}
+		validCount++
+		ratioSum += cell.PerimeterRatio
+		ratioSquareSum += cell.PerimeterRatio * cell.PerimeterRatio
+		if !math.IsNaN(cell.Skewness) {
+			skewnessCount++
+			skewnessSum += cell.Skewness
+			skewnessMax = math.Max(skewnessMax, cell.Skewness)
+		}
+	}
+	if validCount > 0 {
+		perimeterMean = ratioSum / float64(validCount)
+		perimeterRMS = math.Sqrt(ratioSquareSum / float64(validCount))
+	}
+	if skewnessCount > 0 {
+		skewnessAvg = skewnessSum / float64(skewnessCount)
+	}
+	return perimeterMean, perimeterRMS, skewnessAvg, skewnessMax
 }
 
 // polyArea — площадь простого многоугольника по формуле шнурков (знак не

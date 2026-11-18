@@ -92,6 +92,10 @@ var polyMetricDefs = append([]metricDef{
 	{label: "iso avg", description: "Средняя «круглость» ячейки: 4π·S / P², S — площадь, P — периметр. 1 — круг, шестиугольник ≈ 0.91, квадрат ≈ 0.79, треугольник ≈ 0.60.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoAvg }, format: "%.3f"},
 	{label: "iso min", description: "«Круглость» 4π·S / P² самой вытянутой ячейки (1 — круг, правильный шестиугольник ≈ 0.91).", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoMin }, format: "%.3f"},
 	{label: "Разброс площади", description: "Насколько различаются площади ячеек: std/среднее. 0 — все одной площади.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.AreaCV }, format: "%.3f"},
+	{label: "Периметр ph", description: "Средний нормированный периметр rᵢ = pᵢ / p_hex: полный периметр ячейки (у края — по контуру) к периметру правильного шестиугольника целевой площади A/N. 1 — сетка из одинаковых правильных шестиугольников, больше — хуже.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.PerimeterMean }, format: "%.4f"},
+	{label: "Периметр p2h", description: "Среднеквадратичный нормированный периметр √(Σrᵢ²/N). При том же среднем (ph) больше у сетки с бо́льшим разбросом периметров.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.PerimeterRMS }, format: "%.4f"},
+	{label: "Асимметрия S avg", description: "Средняя равноугольная асимметрия: S = max[(α_max − α₀)/(180° − α₀), (α₀ − α_min)/α₀], α₀ = (k−2)·180°/k — угол правильного k-угольника. 0 — все углы ячейки равны. У края граничный участок ячейки заменяется хордой.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.SkewnessAvg }, format: "%.4f"},
+	{label: "Асимметрия S max", description: "Равноугольная асимметрия S самой перекошенной ячейки (0 — все углы равны).", fromMesh: true, value: func(s metricSample) float64 { return s.poly.SkewnessMax }, format: "%.3f"},
 }, particleMetricDefs...)
 
 // metricsView — то, что панель показывает в этом кадре; собирается из

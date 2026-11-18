@@ -51,6 +51,9 @@ var (
 	colHoleContour  = color.NRGBA{R: 0xb0, G: 0x15, B: 0x15, A: 0xff}
 	colSite         = color.NRGBA{R: 0xd6, G: 0x28, B: 0x28, A: 0xff} // частица-генератор ячейки (крестик)
 	colCentroid     = color.NRGBA{R: 0x2a, G: 0x22, B: 0x1c, A: 0xff} // центр масс ячейки (точка)
+	// Призраки — копии периодической сетки вокруг квадрата-периода, бледнее самой сетки.
+	colGhostFill = color.NRGBA{R: 0xfd, G: 0xf8, B: 0xf2, A: 0xff}
+	colGhostEdge = color.NRGBA{R: 0xd8, G: 0xbd, B: 0x9c, A: 0xff}
 )
 
 const (
@@ -91,6 +94,11 @@ type meshView struct {
 	// центры не показываем.
 	centroids []geometry.Point
 	hasMesh   bool
+	// periodContour — квадрат-период периодической сетки (Mesh.Period > 0):
+	// рисуется вместо контура, по которому запускали, — его алгоритм
+	// игнорировал. Один и тот же, пока период прежний, чтобы sameContour
+	// видел "контур не меняли" и не сбрасывал камеру между запусками.
+	periodContour geometry.Geometry
 
 	zoom float32   // множитель поверх "вписать целиком": 1 — исходный вид
 	pan  f32.Point // сдвиг картинки в пикселях вида от положения "по центру"
@@ -117,8 +125,11 @@ type dotLayer struct {
 // строили (его bbox задаёт "вписать целиком", сам контур рисуется поверх).
 // Камера сбрасывается, только если сменился контур — при перезапуске на том же
 // контуре с другими параметрами зум и сдвиг остаются, чтобы сравнивать один и
-// тот же увеличенный участок.
+// тот же увеличенный участок. У периодической сетки вместо g — квадрат-период.
 func (v *meshView) setMesh(m mesh.Mesh, g geometry.Geometry) {
+	if m.Period > 0 {
+		g = v.periodSquare(m.Period)
+	}
 	if !v.hasMesh || !sameContour(v.geom, g) {
 		v.resetCamera()
 	}
@@ -130,6 +141,17 @@ func (v *meshView) setMesh(m mesh.Mesh, g geometry.Geometry) {
 			v.centroids[i] = polygonCentroid(m.Cell(i))
 		}
 	}
+}
+
+// periodSquare — квадрат [0, period]² как контур. period: Mesh.Period.
+// Возвращает тот же объект, пока период не сменился (см. periodContour).
+func (v *meshView) periodSquare(period float64) geometry.Geometry {
+	if outer := v.periodContour.Outer; len(outer) == 0 || outer[2].X != period {
+		v.periodContour = geometry.Geometry{Outer: geometry.Polyline{
+			{X: 0, Y: 0}, {X: period, Y: 0}, {X: period, Y: period}, {X: 0, Y: period},
+		}}
+	}
+	return v.periodContour
 }
 
 // polygonCentroid — центр масс многоугольника (не среднее вершин: у ячейки с
@@ -387,6 +409,12 @@ func (v *meshView) zoomAt(cursor f32.Point, wheelDelta float32, size image.Point
 // Ось Y мира смотрит вверх, экрана — вниз, поэтому y переворачивается.
 func (v *meshView) worldToScreen(size image.Point, marginPx int) func(geometry.Point) f32.Point {
 	bbMin, bbMax := v.geom.BoundingBox()
+	if period := v.mesh.Period; period > 0 {
+		// у периодической сетки при zoom=1 в кадр попадают и призраки — по
+		// полквадрата с каждой стороны
+		bbMin = geometry.Point{X: bbMin.X - period/2, Y: bbMin.Y - period/2}
+		bbMax = geometry.Point{X: bbMax.X + period/2, Y: bbMax.Y + period/2}
+	}
 	worldW, worldH := bbMax.X-bbMin.X, bbMax.Y-bbMin.Y
 	availW, availH := float64(size.X-2*marginPx), float64(size.Y-2*marginPx)
 	fit := 1.0
@@ -413,6 +441,24 @@ func (v *meshView) drawMesh(gtx layout.Context, size image.Point) {
 	// не gtx.Dp(): он округляет до целых пикселей, а рёбрам нужны доли
 	edgePx := float32(edgeWidth) * gtx.Metric.PxPerDp
 	contourPx := float32(contourWidth) * gtx.Metric.PxPerDp
+
+	// Призраки: 8 копий периодической сетки вокруг квадрата-периода, бледнее
+	// самой сетки, — видно, как она стыкуется сама с собой. Рисуются первыми:
+	// ячейки сетки у края выходят за квадрат и ложатся поверх своих копий.
+	if period := v.mesh.Period; period > 0 {
+		for shiftX := -1.0; shiftX <= 1; shiftX++ {
+			for shiftY := -1.0; shiftY <= 1; shiftY++ {
+				if shiftX == 0 && shiftY == 0 {
+					continue
+				}
+				ghostToScreen := func(p geometry.Point) f32.Point {
+					return toScreen(geometry.Point{X: p.X + shiftX*period, Y: p.Y + shiftY*period})
+				}
+				paint.FillShape(gtx.Ops, colGhostFill, clip.Outline{Path: v.cellsPath(gtx.Ops, ghostToScreen)}.Op())
+				paint.FillShape(gtx.Ops, colGhostEdge, clip.Stroke{Path: v.edgesPath(gtx.Ops, ghostToScreen), Width: edgePx}.Op())
+			}
+		}
+	}
 
 	paint.FillShape(gtx.Ops, fillCol, clip.Outline{Path: v.cellsPath(gtx.Ops, toScreen)}.Op())
 	paint.FillShape(gtx.Ops, edgeCol, clip.Stroke{Path: v.edgesPath(gtx.Ops, toScreen), Width: edgePx}.Op())

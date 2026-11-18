@@ -48,12 +48,18 @@ func (Mesher) Name() string { return "charge-voronoi" }
 // Параметры — в долях габарита геометрии, как у sph-quadtree, чтобы оба
 // алгоритма в UI ощущались одинаково.
 var (
-	pH       = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
-	pExp     = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 4, Step: 0.25}
-	pK       = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
-	pDamping = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
-	pClamp   = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
-	pMaxStep = mesher.ParamSpec{Key: "max_step", Label: "Max step (× h)", Min: 0.05, Max: 1, Def: 0.3, Step: 0.05, DependsOn: "clamp"}
+	// Периодическая сетка: контур игнорируется, частицы живут в квадрате, склеенном
+	// сам с собой (ушла за правый край — вышла из левого, так же верх-низ), поэтому
+	// ячейки у правого края стыкуются с ячейками у левого, у верхнего — с нижним.
+	// Граничных зарядов и отражений нет. Выход — квадрат [0,1]² (Mesh.Period = 1):
+	// его копии со сдвигом на 1 по X и Y дают бесконечную сетку без швов.
+	pPeriodic = mesher.ParamSpec{Key: "periodic", Label: "Periodic square (ignore contour)", Kind: mesher.KindBool, Def: 0}
+	pH        = mesher.ParamSpec{Key: "h", Label: "Target cell spacing", Min: 0.02, Max: 0.5, Def: 0.09, Step: 0.005}
+	pExp      = mesher.ParamSpec{Key: "n", Label: "Force exponent (F ~ k/r^n)", Min: 1, Max: 10, Def: 4, Step: 0.25}
+	pK        = mesher.ParamSpec{Key: "k", Label: "Force coefficient k", Min: 0, Max: 1, Def: 1, Step: 0.05}
+	pDamping  = mesher.ParamSpec{Key: "damping", Label: "Velocity damping per step", Min: 0.5, Max: 0.99, Def: 0.85, Step: 0.01}
+	pClamp    = mesher.ParamSpec{Key: "clamp", Label: "Limit step length", Kind: mesher.KindBool, Def: 1}
+	pMaxStep  = mesher.ParamSpec{Key: "max_step", Label: "Max step (× h)", Min: 0.05, Max: 1, Def: 0.3, Step: 0.05, DependsOn: "clamp"}
 	// Без затухания предел шага не отпускает: сила ~1/h^n на порядки больше него,
 	// каждая частица до конца шагает ровно на max_step и не оседает, а итоговая
 	// сетка — снимок этого дрожания. Гасим предел линейно к нулю.
@@ -84,10 +90,14 @@ var (
 )
 
 func (Mesher) Params() []mesher.ParamSpec {
-	return []mesher.ParamSpec{pH, pExp, pK, pDamping, pClamp, pMaxStep, pStepDecay, pBoundaryStep, pRandomInit, pFixSeed, pSeed, pSeparate, pWeldTol, pIters, pLloydIters}
+	return []mesher.ParamSpec{pPeriodic, pH, pExp, pK, pDamping, pClamp, pMaxStep, pStepDecay, pBoundaryStep, pRandomInit, pFixSeed, pSeed, pSeparate, pWeldTol, pIters, pLloydIters}
 }
 
 func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params, sink mesher.Sink) (mesh.Mesh, mesh.QualityMetrics, error) {
+	periodic := p.Bool(pPeriodic)
+	if periodic {
+		g = periodSquare() // контур не нужен; нормализация ниже сделает из квадрата [-0.5, 0.5]², период 1
+	}
 	h := p.Get(pH)
 	expo := p.Get(pExp)
 	k := p.Get(pK)
@@ -124,9 +134,12 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// Граничные заряды — только стенки для релаксации: в ячейки они не идут, до
 	// контура сетку дотягивают отражения (см. buildCells).
 	sink.Progress("init", 0)
-	boundary := resampleBoundary(gn.Outer, boundaryStep) // сыпем у границ
-	for _, hole := range gn.Holes {
-		boundary = append(boundary, resampleBoundary(hole, boundaryStep)...)
+	var boundary []geometry.Point
+	if !periodic { // у периодической сетки стенок нет
+		boundary = resampleBoundary(gn.Outer, boundaryStep) // сыпем у границ
+		for _, hole := range gn.Holes {
+			boundary = append(boundary, resampleBoundary(hole, boundaryStep)...)
+		}
 	}
 	// Случайный сид — из того же диапазона, что и pSeed, чтобы его можно было
 	// вбить обратно и повторить запуск. Отдаём наружу только его (randomSeed),
@@ -140,10 +153,13 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	}
 	rng := rand.New(rand.NewSource(seed))
 	var interior []geometry.Point
-	if randomInit {
-		interior = interiorRandom(gn, h, rng) // сыпем внутрянку на рандом
+	if periodic {
+		interior = periodicLattice(h, rng) // сыпем внутрянку решёткой, склеенной по краям квадрата
 	} else {
 		interior = interiorLattice(gn, h, rng) // сыпем внутрянку
+	}
+	if randomInit {
+		interior = interiorRandom(gn, len(interior), rng) // столько же частиц, но на рандом
 	}
 	if len(interior) < 3 {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, errTooFewCells
@@ -157,9 +173,16 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 	// --- релаксация: попарное отталкивание + затухание ---------------------
 	vel := make([]geometry.Point, len(interior))
 	maxStep := p.Get(pMaxStep) * h // предел смещения частицы за шаг; держит систему в рамках при любых damping/n
-	// граничные заряды — только соседи для NeighborSpread, мерим внутренние
-	withBoundary := make([]geometry.Point, len(interior)+len(boundary))
-	copy(withBoundary[len(interior):], boundary)
+	// Облако для NeighborSpread: внутренние первыми (их и мерим), за ними соседи,
+	// которых не мерим, — граничные заряды, а у периодической сетки копии частиц
+	// из соседних квадратов (иначе у частицы у края не будет соседа из-за края).
+	neighborCloud := func() []geometry.Point {
+		cloud := append([]geometry.Point{}, interior...)
+		if periodic {
+			return append(cloud, periodicImages(interior)...)
+		}
+		return append(cloud, boundary...)
+	}
 	interiorTarget := func(i int) float64 {
 		if i < len(interior) {
 			return h
@@ -180,7 +203,11 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 				if j == i {
 					continue
 				}
-				fx2, fy2 := repel(interior[i], interior[j], k, expo)
+				other := interior[j]
+				if periodic {
+					other = nearestImage(other, interior[i]) // через край квадрата сосед бывает ближе
+				}
+				fx2, fy2 := repel(interior[i], other, k, expo)
 				fx += fx2
 				fy += fy2
 			}
@@ -204,23 +231,25 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 				vel[i] = clampMag(vel[i], stepLimit)
 			}
 			np := geometry.Point{X: interior[i].X + vel[i].X, Y: interior[i].Y + vel[i].Y}
-			if !gn.Contains(np) {
+			if !periodic && !gn.Contains(np) {
 				np = gn.Nearest(np) // граничные заряды почти не выпускают; редкого беглеца хватает вернуть на край
 				vel[i] = geometry.Point{}
 			}
 			stepSum += interior[i].Dist(np)
+			if periodic {
+				np = wrapIntoSquare(np) // ушла за край — выходит с противоположного (после замера шага, иначе он ~1)
+			}
 			interior[i] = np
 		}
 		if it%10 == 0 || it == iters-1 {
-			copy(withBoundary, interior)
 			sink.Progress("relax", float64(it)/float64(iters))
 			sink.Snapshot(mesher.Frame{
 				Stage: "relax", Iter: it, TotalIters: totalIters, Particles: denormAll(interior, denorm),
 				Particle: mesher.ParticleMetrics{
 					MeanStep:       stepSum / float64(len(interior)) / h,
-					NeighborSpread: mesher.NeighborSpread(withBoundary, interiorTarget),
+					NeighborSpread: mesher.NeighborSpread(neighborCloud(), interiorTarget),
 				},
-				BuildMesh: func() (mesh.Mesh, error) { return buildCells(interior, gn, h, weldTol, denorm) },
+				BuildMesh: func() (mesh.Mesh, error) { return buildCells(interior, gn, h, weldTol, periodic, denorm) },
 			})
 		}
 	}
@@ -236,31 +265,34 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 		if err := ctx.Err(); err != nil {
 			return mesh.Mesh{}, mesh.QualityMetrics{}, err
 		}
-		moved, err := lloydStep(interior, gn, h, weldTol)
+		moved, err := lloydStep(interior, gn, h, weldTol, periodic)
 		if err != nil {
 			return mesh.Mesh{}, mesh.QualityMetrics{}, err
 		}
 		var stepSum float64
 		for i := range interior {
-			stepSum += interior[i].Dist(moved[i])
+			if periodic {
+				stepSum += interior[i].Dist(nearestImage(moved[i], interior[i])) // переезд через край — короткий шаг, а не ~1
+			} else {
+				stepSum += interior[i].Dist(moved[i])
+			}
 		}
 		interior = moved
-		copy(withBoundary, interior)
 		sink.Progress("lloyd", float64(it)/float64(lloydIters))
 		sink.Snapshot(mesher.Frame{
 			Stage: "lloyd", Iter: iters + it, TotalIters: totalIters, Particles: denormAll(interior, denorm),
 			Particle: mesher.ParticleMetrics{
 				MeanStep:       stepSum / float64(len(interior)) / h,
-				NeighborSpread: mesher.NeighborSpread(withBoundary, interiorTarget),
+				NeighborSpread: mesher.NeighborSpread(neighborCloud(), interiorTarget),
 			},
-			BuildMesh: func() (mesh.Mesh, error) { return buildCells(interior, gn, h, weldTol, denorm) },
+			BuildMesh: func() (mesh.Mesh, error) { return buildCells(interior, gn, h, weldTol, periodic, denorm) },
 		})
 	}
 	sink.Progress("lloyd", 1)
 
 	// --- ячейки Вороного по осевшим частицам -------------------------------
 	sink.Progress("voronoi", 0)
-	m, err := buildCells(interior, gn, h, weldTol, denorm)
+	m, err := buildCells(interior, gn, h, weldTol, periodic, denorm)
 	if err != nil {
 		return mesh.Mesh{}, mesh.QualityMetrics{}, err
 	}
@@ -280,17 +312,26 @@ func (Mesher) Generate(ctx context.Context, g geometry.Geometry, p mesher.Params
 // interior — подвижные частицы в нормированных координатах (сам срез не
 // меняется, так что годится и посреди релаксации — для живых метрик);
 // gn — нормированный контур; h — шаг ячеек; weldTol — допуск склейки вершин,
-// уже × h; denorm — перевод обратно в мировые координаты.
+// уже × h; periodic — периодическая сетка (см. pPeriodic), тогда gn не нужен;
+// denorm — перевод обратно в мировые координаты.
 // Возвращает многоугольную сетку в мировых координатах.
-func buildCells(interior []geometry.Point, gn geometry.Geometry, h, weldTol float64, denorm func(geometry.Point) geometry.Point) (mesh.Mesh, error) {
+func buildCells(interior []geometry.Point, gn geometry.Geometry, h, weldTol float64, periodic bool, denorm func(geometry.Point) geometry.Point) (mesh.Mesh, error) {
 	// Совпавшие частицы склеиваем в одну перед делоне всегда — до отражений,
 	// чтобы внутренние шли в sites ровно первыми nInterior штуками
 	// (mergeCoincident собирает новый срез, исходный не трогает)
 	interior = mergeCoincident(interior)
-	mirrors := reflectAcrossBoundary(interior, gn, reflectDist*h)
-	// sites = [внутренние | отражения]: индекс < nInterior — настоящая частица
+	// Вспомогательные точки вокруг частиц, своих ячеек не получают: у обычной
+	// сетки — отражения через контур, у периодической — копии частиц из 8
+	// соседних квадратов, с ними ячейка у края строится с соседями из-за края.
+	var helpers []geometry.Point
+	if periodic {
+		helpers = periodicImages(interior)
+	} else {
+		helpers = reflectAcrossBoundary(interior, gn, reflectDist*h)
+	}
+	// sites = [внутренние | отражения или копии]: индекс < nInterior — настоящая частица
 	nInterior := len(interior)
-	sites := append(append([]geometry.Point{}, interior...), mirrors...)
+	sites := append(append([]geometry.Point{}, interior...), helpers...)
 	tris, err := delaunay.Triangulate(sites) // делонешим
 	if err != nil {
 		return mesh.Mesh{}, err
@@ -320,13 +361,20 @@ func buildCells(interior []geometry.Point, gn geometry.Geometry, h, weldTol floa
 		// Вершина между частицей и отражением лежит на контуре (на прямой
 		// стенке — точно, на кривой — почти): прижимаем, чтобы край сетки шёл
 		// ровно по контуру. Так же — любую вершину снаружи (у углов, где
-		// отражение одно, а нужно два).
-		if usesMirror(t, nInterior) || !gn.Contains(c) {
+		// отражение одно, а нужно два). У периодической сетки контура нет, ячейки
+		// у края законно выходят за квадрат.
+		if !periodic && (usesMirror(t, nInterior) || !gn.Contains(c)) {
 			vertexPos[ti] = gn.Nearest(c)
 		}
 	}
 	// тут свариваем микротреугольники в "один" просто дав им один номер (kinda)
-	circumcentersByTriangles := weldVertices(vertexPos, valid, weldTol)
+	var circumcentersByTriangles []int
+	if periodic {
+		// id тут — уже не индексы треугольников, а номера в новом vertexPos
+		vertexPos, circumcentersByTriangles = weldPeriodic(vertexPos, valid, weldTol)
+	} else {
+		circumcentersByTriangles = weldVertices(vertexPos, valid, weldTol)
+	}
 
 	var cells [][]int
 	var cellSites []geometry.Point // частица каждой оставленной ячейки, по индексу cells (мировые координаты)
@@ -346,19 +394,25 @@ func buildCells(interior []geometry.Point, gn geometry.Geometry, h, weldTol floa
 	for i, v := range vertsNorm {
 		worldPos[i] = denorm(v)
 	}
-	return mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true, Sites: cellSites}, nil
+	m := mesh.Mesh{Vertices: worldPos, Cells: cells, Polygonal: true, Sites: cellSites}
+	if periodic {
+		m.Period = 1 // квадрат [0,1]² в мировых (см. periodSquare), [-0.5,0.5]² в нормированных — сторона та же
+	}
+	return m, nil
 }
 
 // lloydStep — одна итерация Ллойда: строит ячейки и переставляет каждую частицу
 // в центр масс её ячейки. Частица остаётся на месте, если её ячейку отсеяли или
-// центр масс вне фигуры (у вогнутых мест ячейка бывает невыпуклой).
+// центр масс вне фигуры (у вогнутых мест ячейка бывает невыпуклой). У
+// периодической сетки центр масс за краем квадрата переносится внутрь с
+// противоположной стороны.
 //
 // interior: подвижные частицы (не меняется), gn: нормированный контур, h: шаг
-// ячеек, weldTol: допуск склейки вершин, уже × h. Возвращает новый срез той же
-// длины и в том же порядке.
-func lloydStep(interior []geometry.Point, gn geometry.Geometry, h, weldTol float64) ([]geometry.Point, error) {
+// ячеек, weldTol: допуск склейки вершин, уже × h, periodic: периодическая
+// сетка. Возвращает новый срез той же длины и в том же порядке.
+func lloydStep(interior []geometry.Point, gn geometry.Geometry, h, weldTol float64, periodic bool) ([]geometry.Point, error) {
 	sameCoords := func(p geometry.Point) geometry.Point { return p }
-	cellMesh, err := buildCells(interior, gn, h, weldTol, sameCoords)
+	cellMesh, err := buildCells(interior, gn, h, weldTol, periodic, sameCoords)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +425,11 @@ func lloydStep(interior []geometry.Point, gn geometry.Geometry, h, weldTol float
 	moved := make([]geometry.Point, len(interior))
 	for i, particle := range interior {
 		moved[i] = particle
-		if centroid, ok := centroidBySite[particle]; ok && gn.Contains(centroid) {
+		centroid, ok := centroidBySite[particle]
+		switch {
+		case ok && periodic:
+			moved[i] = wrapIntoSquare(centroid)
+		case ok && gn.Contains(centroid):
 			moved[i] = centroid
 		}
 	}
@@ -687,6 +745,83 @@ func weldVertices(pos []geometry.Point, valid []bool, tol float64) []int {
 	return circumcentersByTriangles
 }
 
+// weldPeriodic — сварка вершин периодической сетки. Копии одной вершины в
+// соседних квадратах (сдвиг на целое число периодов) свариваются в один класс
+// по расстоянию через край квадрата, и каждая вершина встаёт ровно в позицию
+// представителя класса плюс свой целый сдвиг. Без этого копии одной вершины по
+// разные стороны шва разошлись бы на величину до tol (weldVertices «первый
+// побеждает», а в разных квадратах первым оказывается разный), и копии
+// квадрата стыковались бы с зазором.
+//
+// pos: вершины в нормированных координатах (период 1), valid: есть ли вершина,
+// tol: допуск склейки. Возвращает новые позиции вершин и id каждой входной
+// вершины в них (-1 — невалидная). Одинаковый id — та же вершина в том же
+// квадрате; копии через шов — разные id, но позиции ровно со сдвигом на 1.
+func weldPeriodic(pos []geometry.Point, valid []bool, tol float64) ([]geometry.Point, []int) {
+	wrapped := make([]geometry.Point, len(pos))
+	for i, p := range pos {
+		wrapped[i] = wrapIntoSquare(p)
+	}
+
+	// классы: сварка в квадрате [-0.5, 0.5)², где копии вершины совпали, с
+	// хеш-сеткой, тоже склеенной по краям (клеток на период целое число)
+	cellsPerPeriod := int(math.Max(1, math.Floor(1/math.Max(tol, 1e-9))))
+	type key struct{ x, y int }
+	keyOf := func(p geometry.Point) key {
+		x := int(math.Floor((p.X+0.5)*float64(cellsPerPeriod))) % cellsPerPeriod
+		y := int(math.Floor((p.Y+0.5)*float64(cellsPerPeriod))) % cellsPerPeriod
+		return key{x, y}
+	}
+	grid := map[key][]int{}
+	classOf := make([]int, len(pos))
+	for i, p := range wrapped {
+		classOf[i] = -1
+		if !valid[i] {
+			continue
+		}
+		classOf[i] = i
+		k := keyOf(p)
+	search:
+		for dx := -1; dx <= 1; dx++ {
+			for dy := -1; dy <= 1; dy++ {
+				neighborKey := key{(k.x + dx + cellsPerPeriod) % cellsPerPeriod, (k.y + dy + cellsPerPeriod) % cellsPerPeriod}
+				for _, j := range grid[neighborKey] {
+					if wrapped[j].Dist(nearestImage(p, wrapped[j])) < tol {
+						classOf[i] = j
+						break search
+					}
+				}
+			}
+		}
+		if classOf[i] == i {
+			grid[k] = append(grid[k], i)
+		}
+	}
+
+	// вершина = представитель класса + целый сдвиг до её собственного места
+	type vertexKey struct{ class, shiftX, shiftY int }
+	idByKey := map[vertexKey]int{}
+	var out []geometry.Point
+	ids := make([]int, len(pos))
+	for i, class := range classOf {
+		ids[i] = -1
+		if class < 0 {
+			continue
+		}
+		base := wrapped[class]
+		shiftX, shiftY := math.Round(pos[i].X-base.X), math.Round(pos[i].Y-base.Y)
+		vk := vertexKey{class, int(shiftX), int(shiftY)}
+		id, ok := idByKey[vk]
+		if !ok {
+			id = len(out)
+			idByKey[vk] = id
+			out = append(out, geometry.Point{X: base.X + shiftX, Y: base.Y + shiftY})
+		}
+		ids[i] = id
+	}
+	return out, ids
+}
+
 // compactVertices оставляет только вершины, на которые ссылаются ячейки, и
 // перенумеровывает ячейки под новый плотный массив.
 func compactVertices(pos []geometry.Point, cells [][]int) ([]geometry.Point, [][]int) {
@@ -771,13 +906,12 @@ func resampleBoundary(pl geometry.Polyline, step float64) []geometry.Point {
 	return out
 }
 
-// interiorRandom сеет столько же подвижных зарядов, сколько дала бы
-// шестиугольная решётка (interiorLattice), но равномерно случайно по фигуре.
+// interiorRandom сеет подвижные заряды равномерно случайно по фигуре — обычно
+// столько же, сколько дала решётка (interiorLattice или periodicLattice).
 //
-// g: нормированная фигура, step: шаг решётки (нужен только для числа частиц),
-// rng: источник случайности. Возвращает частицы внутри фигуры.
-func interiorRandom(g geometry.Geometry, step float64, rng *rand.Rand) []geometry.Point {
-	count := len(interiorLattice(g, step, rng))
+// g: нормированная фигура, count: сколько частиц, rng: источник случайности.
+// Возвращает частицы внутри фигуры.
+func interiorRandom(g geometry.Geometry, count int, rng *rand.Rand) []geometry.Point {
 	min, max := g.BoundingBox()
 	out := make([]geometry.Point, 0, count)
 	for len(out) < count {
@@ -825,6 +959,74 @@ func interiorLattice(g geometry.Geometry, step float64, rng *rand.Rand) []geomet
 			if g.Contains(p) {
 				out = append(out, p)
 			}
+		}
+	}
+	return out
+}
+
+// periodSquare — квадрат-период периодической сетки в мировых координатах,
+// [0,1]². Подставляется вместо контура; нормализация делает из него
+// [-0.5, 0.5]², так что период в нормированных координатах ровно 1.
+func periodSquare() geometry.Geometry {
+	return geometry.Geometry{Outer: geometry.Polyline{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 1, Y: 1}, {X: 0, Y: 1}}}
+}
+
+// nearestImage — копия точки p со сдвигом на целое число периодов по X и Y,
+// ближайшая к from. Период 1 (нормированные координаты).
+func nearestImage(p, from geometry.Point) geometry.Point {
+	return geometry.Point{X: p.X + math.Round(from.X-p.X), Y: p.Y + math.Round(from.Y-p.Y)}
+}
+
+// wrapIntoSquare возвращает точку в квадрат-период [-0.5, 0.5)²: ушла за
+// правый край — выходит из левого, так же по Y.
+func wrapIntoSquare(p geometry.Point) geometry.Point {
+	return geometry.Point{X: p.X - math.Floor(p.X+0.5), Y: p.Y - math.Floor(p.Y+0.5)}
+}
+
+// periodicImages — копии частиц в 8 квадратах вокруг основного (сдвиги на -1,
+// 0, +1 по X и Y, кроме нулевого). С ними у частицы у края есть соседи из-за
+// края, и её ячейка выходит такой же, как в бесконечной сетке. Копируем все
+// частицы, а не полосу у края: так верно при любой расстановке (и посреди
+// релаксации со случайного посева), а Делоне по 9N точкам всё равно быстрый.
+//
+// particles: частицы в [-0.5, 0.5)². Возвращает 8·len(particles) точек.
+func periodicImages(particles []geometry.Point) []geometry.Point {
+	out := make([]geometry.Point, 0, 8*len(particles))
+	for shiftX := -1.0; shiftX <= 1; shiftX++ {
+		for shiftY := -1.0; shiftY <= 1; shiftY++ {
+			if shiftX == 0 && shiftY == 0 {
+				continue
+			}
+			for _, p := range particles {
+				out = append(out, geometry.Point{X: p.X + shiftX, Y: p.Y + shiftY})
+			}
+		}
+	}
+	return out
+}
+
+// periodicLattice сеет шестиугольную решётку, склеенную по краям квадрата
+// [-0.5, 0.5)²: столбцов и рядов целое число на период, рядов чётное (иначе
+// сдвиг нечётных рядов на полшага не сойдётся через край). Из-за округления
+// решётка чуть сжата или растянута относительно идеальной (шаг step, ряды
+// через step·√3/2) — это выправляет релаксация. Джиттер как в interiorLattice.
+//
+// step: шаг решётки, rng: источник джиттера. Возвращает частицы в квадрате.
+func periodicLattice(step float64, rng *rand.Rand) []geometry.Point {
+	cols := int(math.Max(1, math.Round(1/step)))
+	rows := 2 * int(math.Max(1, math.Round(1/(step*math.Sqrt(3))))) // rows·step·√3/2 ≈ 1, чётное
+	colStep, rowStep := 1/float64(cols), 1/float64(rows)
+	out := make([]geometry.Point, 0, cols*rows)
+	for row := 0; row < rows; row++ {
+		oddRowShift := 0.0
+		if row%2 != 0 {
+			oddRowShift = colStep / 2
+		}
+		for col := 0; col < cols; col++ {
+			out = append(out, wrapIntoSquare(geometry.Point{
+				X: -0.5 + float64(col)*colStep + oddRowShift + (rng.Float64()-0.5)*step*0.05,
+				Y: -0.5 + float64(row)*rowStep + (rng.Float64()-0.5)*step*0.05,
+			}))
 		}
 	}
 	return out
