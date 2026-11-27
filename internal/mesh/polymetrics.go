@@ -88,6 +88,9 @@ func EvaluatePolyWithCells(m Mesh, g geometry.Geometry) (PolyQualityMetrics, []C
 		}
 		valid++
 
+		if cells[i].Sides >= 3 {
+			n = cells[i].Sides
+		}
 		sidesSum += float64(n)
 		if n < q.MinSides {
 			q.MinSides = n

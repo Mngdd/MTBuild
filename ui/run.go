@@ -40,13 +40,14 @@ func mustDecodePNG(pngBytes []byte) image.Image {
 }
 
 type generateResult struct {
-	mesh        mesh.Mesh
-	geom        geometry.Geometry // контур, по которому строили — meshView рисует его поверх сетки
-	metrics     mesh.QualityMetrics
-	polyMetrics mesh.PolyQualityMetrics
-	cellMetrics []mesh.CellQuality
-	polygonal   bool // which of metrics/polyMetrics is meaningful — mesher.Mesher.Generate always returns a zero QualityMetrics for a polygonal mesh (see internal/mesher/charge's doc comment), so this is computed here rather than inferred from metrics being non-zero
-	err         error
+	mesh          mesh.Mesh
+	geom          geometry.Geometry // контур, по которому строили — meshView рисует его поверх сетки
+	metrics       mesh.QualityMetrics
+	polyMetrics   mesh.PolyQualityMetrics
+	cellMetrics   []mesh.CellQuality
+	distributions cellMetricDistributions
+	polygonal     bool // which of metrics/polyMetrics is meaningful — mesher.Mesher.Generate always returns a zero QualityMetrics for a polygonal mesh (see internal/mesher/charge's doc comment), so this is computed here rather than inferred from metrics being non-zero
+	err           error
 }
 
 // runState owns Start/Stop and the outcome of the background Generate call.
@@ -63,12 +64,13 @@ type runState struct {
 	cancel   context.CancelFunc
 	resultCh chan generateResult
 
-	view        meshView // последняя готовая сетка + камера просмотра
-	metrics     mesh.QualityMetrics
-	polyMetrics mesh.PolyQualityMetrics
-	polygonal   bool // форма сетки текущего (или последнего) запуска — известна уже при Start
-	hasFinal    bool // metrics/polyMetrics — итог последнего запуска (он дошёл до конца без ошибки)
-	err         error
+	view          meshView // последняя готовая сетка + камера просмотра
+	metrics       mesh.QualityMetrics
+	polyMetrics   mesh.PolyQualityMetrics
+	distributions cellMetricDistributions
+	polygonal     bool // форма сетки текущего (или последнего) запуска — известна уже при Start
+	hasFinal      bool // metrics/polyMetrics — итог последнего запуска (он дошёл до конца без ошибки)
+	err           error
 
 	progress *progressSink  // текущего запуска; nil — ещё не запускали
 	samples  []metricSample // копия истории метрик из progress, обновляется в poll
@@ -158,6 +160,7 @@ func (r *runState) poll() {
 			r.view.setMesh(res.mesh, res.geom, res.cellMetrics)
 			r.metrics = res.metrics
 			r.polyMetrics = res.polyMetrics
+			r.distributions = res.distributions
 			r.polygonal = res.polygonal
 			r.hasFinal = true
 		}
@@ -211,12 +214,14 @@ func (r *runState) start(algoName string, geom geometry.Geometry, params mesher.
 		// come from mesh.EvaluatePoly instead.
 		var polyMetrics mesh.PolyQualityMetrics
 		var cellMetrics []mesh.CellQuality
+		var distributions cellMetricDistributions
 		if m.Polygonal {
 			polyMetrics, cellMetrics = mesh.EvaluatePolyWithCells(m, geom)
+			distributions = buildCellDistributions(cellMetrics)
 		}
 		r.resultCh <- generateResult{
 			mesh: m, geom: geom, metrics: metrics, polyMetrics: polyMetrics,
-			cellMetrics: cellMetrics, polygonal: m.Polygonal,
+			cellMetrics: cellMetrics, distributions: distributions, polygonal: m.Polygonal,
 		}
 		r.win.Invalidate()
 	}()
@@ -279,6 +284,7 @@ func (r *runState) metricsView() metricsView {
 	}
 	if r.hasFinal {
 		view.final = &metricSample{hasMesh: true, tri: r.metrics, poly: r.polyMetrics}
+		view.distributions = r.distributions
 	}
 	return view
 }

@@ -54,7 +54,7 @@ func TestCellQualities_RegularHexagonWithoutContour(t *testing.T) {
 }
 
 // Круг — правильный 128-угольник радиуса 1, четыре ячейки-четверти: центр и
-// 33 вершины контура. Периметр у края идёт по контуру (а не хордой), A —
+// 33 вершины контура. Периметр включает все отрезки ячейки вдоль круга, A —
 // площадь 128-угольника, для S дуга заменяется хордой — остаётся
 // прямоугольный равнобедренный треугольник, S = 0.25.
 func TestCellQualities_QuarterDisks(t *testing.T) {
@@ -80,6 +80,17 @@ func TestCellQualities_QuarterDisks(t *testing.T) {
 		if math.Abs(cell.PerimeterRatio-wantRatio) > 1e-9 || math.Abs(cell.Skewness-0.25) > 1e-9 {
 			t.Errorf("cell %d: got r = %v, S = %v; want r = %v, S = 0.25", i, cell.PerimeterRatio, cell.Skewness, wantRatio)
 		}
+	}
+}
+
+func TestCellQualities_PerimeterUsesMeshEdges(t *testing.T) {
+	outer := geometry.Polyline{{X: 0, Y: 0}, {X: 1, Y: 0}, {X: 1, Y: 1}, {X: 0, Y: 1}}
+	m := Mesh{Polygonal: true, Vertices: outer[:3], Cells: [][]int{{0, 1, 2}}}
+	// Замыкающее ребро ячейки — диагональ квадрата длины √2.
+	want := (2 + math.Sqrt2) / math.Sqrt(8*math.Sqrt(3))
+	cell := CellQualities(m, geometry.Geometry{Outer: outer})[0]
+	if !cell.Valid || math.Abs(cell.PerimeterRatio-want) > 1e-12 {
+		t.Errorf("cell r = %v, valid = %v; want r = %v", cell.PerimeterRatio, cell.Valid, want)
 	}
 }
 

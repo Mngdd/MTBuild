@@ -92,7 +92,7 @@ var polyMetricDefs = append([]metricDef{
 	{label: "iso avg", description: "Средняя «круглость» ячейки: 4π·S / P², S — площадь, P — периметр. 1 — круг, шестиугольник ≈ 0.91, квадрат ≈ 0.79, треугольник ≈ 0.60.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoAvg }, format: "%.3f"},
 	{label: "iso min", description: "«Круглость» 4π·S / P² самой вытянутой ячейки (1 — круг, правильный шестиугольник ≈ 0.91).", fromMesh: true, value: func(s metricSample) float64 { return s.poly.IsoMin }, format: "%.3f"},
 	{label: "Разброс площади", description: "Насколько различаются площади ячеек: std/среднее. 0 — все одной площади.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.AreaCV }, format: "%.3f"},
-	{label: "Периметр ph", description: "Средний нормированный периметр rᵢ = pᵢ / p_hex: полный периметр ячейки (у края — по контуру) к периметру правильного шестиугольника целевой площади A/N. 1 — сетка из одинаковых правильных шестиугольников, больше — хуже.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.PerimeterMean }, format: "%.4f"},
+	{label: "Периметр ph", description: "Средний нормированный периметр rᵢ = pᵢ / p_hex: сумма длин рёбер ячейки к периметру правильного шестиугольника целевой площади A/N. 1 — сетка из одинаковых правильных шестиугольников, больше — хуже.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.PerimeterMean }, format: "%.4f"},
 	{label: "Периметр p2h", description: "Среднеквадратичный нормированный периметр √(Σrᵢ²/N). При том же среднем (ph) больше у сетки с бо́льшим разбросом периметров.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.PerimeterRMS }, format: "%.4f"},
 	{label: "Асимметрия S avg", description: "Средняя равноугольная асимметрия: S = max[(α_max − α₀)/(180° − α₀), (α₀ − α_min)/α₀], α₀ = (k−2)·180°/k — угол правильного k-угольника. 0 — все углы ячейки равны. У края граничный участок ячейки заменяется хордой.", fromMesh: true, value: func(s metricSample) float64 { return s.poly.SkewnessAvg }, format: "%.4f"},
 	{label: "Асимметрия S max", description: "Равноугольная асимметрия S самой перекошенной ячейки (0 — все углы равны).", fromMesh: true, value: func(s metricSample) float64 { return s.poly.SkewnessMax }, format: "%.3f"},
@@ -101,12 +101,13 @@ var polyMetricDefs = append([]metricDef{
 // metricsView — то, что панель показывает в этом кадре; собирается из
 // runState (см. runState.metricsView), чтобы панель не лезла в его поля.
 type metricsView struct {
-	running    bool
-	polygonal  bool
-	totalIters int            // итераций у запуска; 0 — неитерационный алгоритм или ещё не знаем
-	samples    []metricSample // история по кадрам
-	final      *metricSample  // итог по готовой сетке; nil — расчёт идёт, упал или ещё не запускали
-	seed       int64          // случайный сид запуска; 0 — сид задан параметром или его нет
+	running       bool
+	polygonal     bool
+	totalIters    int            // итераций у запуска; 0 — неитерационный алгоритм или ещё не знаем
+	samples       []metricSample // история по кадрам
+	final         *metricSample  // итог по готовой сетке; nil — расчёт идёт, упал или ещё не запускали
+	seed          int64          // случайный сид запуска; 0 — сид задан параметром или его нет
+	distributions cellMetricDistributions
 }
 
 // series — точки графика одной метрики: x — итерация, y — значение.
@@ -285,6 +286,14 @@ func (p *metricsPanel) body(gtx layout.Context, th *material.Theme, view metrics
 			}
 			return layout.Inset{Bottom: metricsGap}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				return p.sidesHistogramCard(gtx, th, view)
+			})
+		}),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			if !view.polygonal || view.final == nil {
+				return layout.Dimensions{}
+			}
+			return layout.Inset{Bottom: metricsGap}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return p.distributionCards(gtx, th, view.distributions)
 			})
 		}),
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {

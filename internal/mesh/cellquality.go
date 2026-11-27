@@ -9,8 +9,8 @@ import (
 // CellQuality — метрики одной многоугольной ячейки по методике «Качество сеток
 // в круговой области»: нормированный периметр rᵢ и равноугольная асимметрия S.
 type CellQuality struct {
-	// PerimeterRatio — rᵢ = pᵢ / p_hex. pᵢ — полный периметр ячейки, участок
-	// внешней границы меряется по контуру, а не хордой. p_hex = √(8√3·A/N) —
+	// PerimeterRatio — rᵢ = pᵢ / p_hex. pᵢ — сумма длин всех рёбер ячейки.
+	// p_hex = √(8√3·A/N) —
 	// периметр правильного шестиугольника целевой площади A/N (A — площадь
 	// области, N — число ячеек). 1 — как у такого шестиугольника, больше — хуже.
 	PerimeterRatio float64
@@ -20,6 +20,8 @@ type CellQuality struct {
 	// рёбра по контуру) заменяется хордой между его концами. NaN — после этого у
 	// ячейки не осталось трёх углов (она целиком граница).
 	Skewness float64
+	// Sides — число сторон с граничной цепочкой, посчитанной как одна сторона.
+	Sides int
 	// Valid — false у вырожденной ячейки (меньше 3 вершин или нулевая площадь);
 	// остальные поля у неё нулевые, в средние она не идёт.
 	Valid bool
@@ -82,20 +84,33 @@ func CellQualities(m Mesh, g geometry.Geometry) []CellQuality {
 	// Где каждая вершина на контуре (если на нём): считаем один раз на вершину,
 	// а не на каждую ячейку, где она встречается.
 	onContour := make([]contourSpot, len(m.Vertices))
+	boundaryCandidates := make(map[[2]int]int)
+	edgeKey := func(a, b int) [2]int { return [2]int{min(a, b), max(a, b)} }
 	if len(tracks) > 0 {
 		minBox, maxBox := g.BoundingBox()
 		tolerance := 1e-9 * minBox.Dist(maxBox) // вершины у края алгоритм прижимает на контур точно, с точностью до округления
 		for v, p := range m.Vertices {
 			onContour[v] = locateOnContours(tracks, p, tolerance)
 		}
+		for _, cell := range m.Cells {
+			for k, a := range cell {
+				b := cell[(k+1)%len(cell)]
+				if onContour[a].on && onContour[b].on {
+					boundaryCandidates[edgeKey(a, b)]++
+				}
+			}
+		}
 	}
-	alongContour := func(a, b int) (arc float64, ok bool) {
+	alongContour := func(a, b int) bool {
 		spotA, spotB := onContour[a], onContour[b]
 		if !spotA.on || !spotB.on || spotA.track != spotB.track {
-			return 0, false
+			return false
 		}
-		arc = tracks[spotA.track].arcBetween(spotA.along, spotB.along)
-		return arc, arc <= boundaryEdgeArcToChord*m.Vertices[a].Dist(m.Vertices[b])
+		if boundaryCandidates[edgeKey(a, b)] != 1 {
+			return false
+		}
+		arc := tracks[spotA.track].arcBetween(spotA.along, spotB.along)
+		return arc <= boundaryEdgeArcToChord*m.Vertices[a].Dist(m.Vertices[b])
 	}
 
 	for i, cell := range m.Cells {
@@ -104,16 +119,9 @@ func CellQualities(m Mesh, g geometry.Geometry) []CellQuality {
 			continue
 		}
 		count := len(cell)
-		var perimeter float64
 		boundaryEdge := make([]bool, count) // ребро cell[k] -> cell[k+1] лежит вдоль контура
-		for k := range cell {
-			a, b := cell[k], cell[(k+1)%count]
-			if arc, ok := alongContour(a, b); ok {
-				boundaryEdge[k] = true
-				perimeter += arc
-			} else {
-				perimeter += m.Vertices[a].Dist(m.Vertices[b])
-			}
+		for k, a := range cell {
+			boundaryEdge[k] = alongContour(a, cell[(k+1)%count])
 		}
 
 		// граничный участок -> хорда: выкидываем вершины внутри участка (у
@@ -126,8 +134,9 @@ func CellQualities(m Mesh, g geometry.Geometry) []CellQuality {
 		}
 
 		out[i] = CellQuality{
-			PerimeterRatio: perimeter / hexPerimeter,
+			PerimeterRatio: polyPerimeter(poly) / hexPerimeter,
 			Skewness:       equiangleSkewness(corners),
+			Sides:          len(corners),
 			Valid:          true,
 		}
 	}
